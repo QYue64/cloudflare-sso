@@ -1,0 +1,29 @@
+{
+  "name": "cloudflare-sso",
+  "version": "1.0.0",
+  "description": "A self-hosted OIDC/SSO platform built on Cloudflare Workers, Pages and D1.",
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "dev:worker": "wrangler dev --ip 127.0.0.1 --port 8787",
+    "dev:pages": "wrangler pages dev pages --ip 127.0.0.1 --port 8788 --inspector-port 0",
+    "deploy:worker": "wrangler deploy",
+    "deploy:pages": "wrangler pages deploy pages --project-name cloudflare-sso-pages",
+    "types": "wrangler types",
+    "typecheck": "tsc --noEmit",
+    "db:migrate:local": "wrangler d1 migrations apply cloudflare-sso --local",
+    "db:migrate:remote": "wrangler d1 migrations apply cloudflare-sso --remote"
+  },
+  "keywords": ["cloudflare", "oidc", "sso", "workers", "pages", "d1"],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "hono": "^4.12.24",
+    "jose": "^6.2.3"
+  },
+  "devDependencies": {
+    "@types/node": "^25.9.2",
+    "typescript": "^6.0.3",
+    "wrangler": "^4.98.0"
+  }
+}

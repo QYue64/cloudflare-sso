@@ -1,0 +1,1 @@
+ALTER TABLE clients ADD COLUMN pkce_required INTEGER NOT NULL DEFAULT 1;

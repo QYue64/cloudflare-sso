@@ -1,0 +1,35 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "cloudflare-sso",
+  "main": "src/index.ts",
+  "pages_build_output_dir": "pages",
+  "compatibility_date": "2026-06-08",
+  "compatibility_flags": ["nodejs_compat_v2"],
+  "workers_dev": true,
+  "rules": [
+    {
+      "type": "ESModule",
+      "globs": ["**/*.ts"]
+    }
+  ],
+  "triggers": {
+    "crons": ["17 3 * * *"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "cloudflare-sso",
+      "database_id": "replace-with-your-d1-database-id"
+    }
+  ],
+  "vars": {
+    "ISSUER": "https://your-domain.example",
+    "PAGES_ORIGIN": "https://your-domain.example",
+    "EXTRA_CORS_ORIGINS": "",
+    "ENVIRONMENT": "production"
+  },
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1
+  }
+}

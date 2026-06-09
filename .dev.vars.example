@@ -1,0 +1,2 @@
+OIDC_PRIVATE_JWK={"kty":"EC","crv":"P-256","x":"...","y":"...","d":"...","kid":"local-dev"}
+ADMIN_BOOTSTRAP_TOKEN=replace-with-a-long-random-token
