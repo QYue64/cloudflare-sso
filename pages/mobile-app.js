@@ -618,6 +618,18 @@
               <p @click="copyConfigValue(origin + '/oauth/token')"><b>Token</b><code>{{ origin }}/oauth/token</code></p>
               <p @click="copyConfigValue(origin + '/oauth/userinfo')"><b>UserInfo</b><code>{{ origin }}/oauth/userinfo</code></p>
               <p @click="copyConfigValue((state.adminFormData.redirectUris || [])[0] || '')"><b>Redirect URI</b><code>{{ (state.adminFormData.redirectUris || [])[0] || '-' }}</code></p>
+              <div class="nut-integration-docs">
+                <section>
+                  <strong>有自己的用户表</strong>
+                  <span>本地用户表保留业务角色、权限、套餐等字段，新增 sso_sub 并设唯一索引。</span>
+                  <code>callback 换 token -> 读取 userinfo -> 按 sub upsert 用户 -> 创建本地 session</code>
+                </section>
+                <section>
+                  <strong>没有自己的用户表</strong>
+                  <span>应用不保存密码和本地用户，只在业务表保存 owner_sub / created_by_sub。</span>
+                  <code>登录后把 sub、email、preferred_username 写入应用 session</code>
+                </section>
+              </div>
               <div class="nut-form-actions single"><button type="button" class="nut-form-button primary" @click="closeAdminForm">关闭</button></div>
             </div>
 

@@ -1502,6 +1502,51 @@ td code {
   line-height: 1.55;
 }
 
+.integration-docs {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.integration-docs article {
+  display: grid;
+  gap: 8px;
+  align-content: start;
+  padding: 12px;
+  border: 1px solid #d9e3f0;
+  border-radius: 8px;
+  background: #fbfdff;
+}
+
+.integration-docs h3 {
+  margin: 0;
+  color: #111827;
+  font-size: 14px;
+  line-height: 1.25;
+}
+
+.integration-docs p {
+  color: #64748b;
+  font-size: 12px;
+  line-height: 1.65;
+}
+
+.integration-docs pre {
+  overflow: auto;
+  margin: 0;
+  padding: 10px;
+  border-radius: 7px;
+  background: #f1f7f7;
+  color: #111827;
+  font-size: 11px;
+  line-height: 1.55;
+}
+
+.integration-docs code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
 /* NutUI mobile shell */
 #mobile-app[hidden] {
   display: none !important;
@@ -1943,6 +1988,42 @@ td code {
   background: transparent;
   color: #111827;
   font-size: 12px;
+}
+
+.nut-integration-docs {
+  display: grid;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.nut-integration-docs section {
+  display: grid;
+  gap: 6px;
+  padding: 10px;
+  border: 1px solid #dbe7ef;
+  border-radius: 10px;
+  background: #fbfdff;
+}
+
+.nut-integration-docs strong {
+  color: #111827;
+  font-size: 13px;
+}
+
+.nut-integration-docs span {
+  color: #64748b;
+  font-size: 12px;
+  line-height: 1.55;
+}
+
+.nut-integration-docs code {
+  display: block;
+  padding: 8px;
+  border-radius: 8px;
+  background: #f1f7f7;
+  color: #0f766e;
+  font-size: 11px;
+  line-height: 1.5;
 }
 
 .nut-mobile-loading {
@@ -2652,5 +2733,9 @@ td code {
     grid-template-columns: 1fr;
     gap: 2px;
     padding: 8px 9px;
+  }
+
+  .integration-docs {
+    grid-template-columns: 1fr;
   }
 }

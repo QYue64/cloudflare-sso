@@ -819,6 +819,7 @@ function renderClientDetailsModal() {
         <div class="config-list">
           ${fields.map(renderConfigField).join("")}
         </div>
+        ${renderClientIntegrationDocs(client)}
       </section>
     </div>
   `;
@@ -863,6 +864,56 @@ function clientConfigFields(client, clientSecret) {
     { label: "Scopes", value: client.allowedScopes?.join(" ") || "openid profile email sub" },
     { label: "Auth Style", value: client.confidential ? "Basic Auth Header 或 Request Body" : "None / PKCE" }
   ];
+}
+
+function renderClientIntegrationDocs(client) {
+  const issuer = window.location.origin;
+  const callback = client.redirectUris?.[0] ?? "https://your-app.example/auth/callback";
+  const scopes = client.allowedScopes?.join(" ") || "openid profile email";
+  const authorizeUrl = `${issuer}/oauth/authorize`;
+  const tokenUrl = `${issuer}/oauth/token`;
+  const userinfoUrl = `${issuer}/oauth/userinfo`;
+  return `
+    <div class="integration-docs">
+      <article>
+        <h3>有自己的用户表</h3>
+        <p>适合业务系统保留用户、角色、套餐、项目权限等数据，只把登录、注册、改密交给统一登陆平台。</p>
+        <pre><code>users:
+  id
+  sso_sub unique
+  username
+  email
+  display_name
+  role</code></pre>
+        <p>接入流程：跳转授权页 → callback 换 token → 读取 userinfo → 按 sso_sub upsert 本地用户 → 创建业务系统 session。</p>
+        <pre><code>Issuer: ${escapeHtml(issuer)}
+Client ID: ${escapeHtml(client.id)}
+Redirect URI: ${escapeHtml(callback)}
+Scope: ${escapeHtml(scopes)}
+Authorization URL: ${escapeHtml(authorizeUrl)}
+Token URL: ${escapeHtml(tokenUrl)}
+UserInfo URL: ${escapeHtml(userinfoUrl)}
+User ID Claim: sub
+Username Claim: preferred_username
+Email Claim: email</code></pre>
+      </article>
+      <article>
+        <h3>没有自己的用户表</h3>
+        <p>适合新项目或纯内部工具。应用不保存密码，也不维护本地用户，只保存自己的业务数据并引用 SSO 用户 ID。</p>
+        <pre><code>业务表建议:
+  owner_sub
+  created_by_sub
+  updated_by_sub</code></pre>
+        <p>接入流程：未登录时跳转统一登陆平台 → callback 换 token → 校验 id_token/userinfo → 把 sub、email、username 写入应用 session。</p>
+        <pre><code>session.user = {
+  sub: userinfo.sub,
+  username: userinfo.preferred_username,
+  email: userinfo.email,
+  name: userinfo.name
+}</code></pre>
+      </article>
+    </div>
+  `;
 }
 
 function renderSecurityList() {
