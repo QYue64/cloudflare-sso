@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" role="img" aria-label="统一登陆平台">
+  <defs>
+    <linearGradient id="bg" x1="18" y1="14" x2="110" y2="116" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#10B8AA"/>
+      <stop offset="1" stop-color="#087E78"/>
+    </linearGradient>
+    <linearGradient id="key" x1="30" y1="41" x2="104" y2="84" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#D7FFFA"/>
+    </linearGradient>
+  </defs>
+  <rect width="128" height="128" rx="30" fill="url(#bg)"/>
+  <rect x="24" y="24" width="80" height="80" rx="24" fill="#FFFFFF" opacity=".12"/>
+  <path fill="url(#key)" fill-rule="evenodd" d="M51 41c-12.7 0-23 10.3-23 23s10.3 23 23 23c10.3 0 19-6.8 21.9-16h11.6l5.8 7.2a3 3 0 0 0 4.7 0l4.2-5.2h5.8a3 3 0 0 0 3-3V58a3 3 0 0 0-3-3H72.9C70 47.8 61.3 41 51 41Zm0 14a9 9 0 1 0 0 18 9 9 0 0 0 0-18Z" clip-rule="evenodd"/>
+  <circle cx="51" cy="64" r="5" fill="#0F766E" opacity=".28"/>
+  <rect x="73" y="61" width="29" height="6" rx="3" fill="#FFFFFF" opacity=".45"/>
+</svg>

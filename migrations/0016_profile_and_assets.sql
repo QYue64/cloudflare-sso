@@ -1,0 +1,6 @@
+ALTER TABLE users ADD COLUMN nickname TEXT;
+ALTER TABLE users ADD COLUMN gender TEXT;
+ALTER TABLE users ADD COLUMN birthday TEXT;
+ALTER TABLE users ADD COLUMN avatar_url TEXT;
+
+ALTER TABLE clients ADD COLUMN logo_url TEXT;

@@ -22,6 +22,10 @@ type User = {
   username: string | null;
   email: string;
   display_name: string;
+  nickname: string | null;
+  gender: string | null;
+  birthday: string | null;
+  avatar_url: string | null;
   email_verified: number;
   is_admin: number;
   is_active: number;
@@ -34,9 +38,27 @@ type Client = {
   allowed_scopes: string;
   secret_hash: string | null;
   client_secret_encrypted: string | null;
+  logo_url: string | null;
+  app_url: string | null;
   pkce_required: number;
+  return_roles: number;
+  allow_registration: number;
   is_active: number;
   created_at?: string;
+};
+
+type UserClientProfile = {
+  id: string;
+  user_id: string;
+  client_id: string;
+  username: string | null;
+  email: string | null;
+  display_name: string | null;
+  nickname: string | null;
+  avatar_url: string | null;
+  email_verified_at: string | null;
+  created_at: string;
+  updated_at: string;
 };
 
 type Session = {
@@ -89,13 +111,15 @@ type OAuthGrantRow = {
   id: string;
   client_id: string;
   client_name: string;
+  client_logo_url: string | null;
+  client_app_url: string | null;
   scope: string;
   last_redirect_uri: string;
   granted_at: string;
   updated_at: string;
 };
 
-type EmailPurpose = "register" | "bind_email" | "smtp_test";
+type EmailPurpose = "register" | "bind_email" | "reset_password" | "smtp_test";
 
 type EmailCode = {
   id: string;
@@ -144,6 +168,12 @@ type EmailDeliveryConfig =
   | { provider: "resend"; apiKey: string; fromEmail: string; fromName: string }
   | ({ provider: "smtp" } & SmtpConfig);
 
+type SystemSettings = {
+  siteName: string;
+  logoUrl: string;
+  registrationEnabled: boolean;
+};
+
 const app = new Hono<{ Bindings: Bindings }>();
 const sessionCookie = "sso_session";
 const sessionMaxAgeSeconds = 60 * 60 * 12;
@@ -155,6 +185,11 @@ const emailCodeCooldownSeconds = 60;
 const emailCodeHourlyLimit = 5;
 
 app.options("*", (c) => withCors(c, new Response(null, { status: 204 })));
+
+app.get("/api/system/settings", async (c) => {
+  const settings = await getSystemSettings(c.env.DB);
+  return withCors(c, c.json(settings));
+});
 
 app.get("/.well-known/openid-configuration", (c) => {
   return c.json(oauthServerMetadata(c.env.ISSUER));
@@ -188,7 +223,7 @@ function oauthServerMetadata(issuerInput: string) {
     revocation_endpoint_auth_methods_supported: ["client_secret_basic", "client_secret_post", "none"],
     introspection_endpoint_auth_methods_supported: ["client_secret_basic", "client_secret_post", "none"],
     code_challenge_methods_supported: ["S256"],
-    claims_supported: ["id", "sub", "email", "email_verified", "name"]
+    claims_supported: ["id", "sub", "email", "email_verified", "name", "roles"]
   };
 }
 
@@ -291,23 +326,49 @@ app.get("/api/oauth/authorize/context", async (c) => {
   }
 
   const user = await getUserById(c.env.DB, session.user_id);
+  const clientProfile = user ? await getUserClientProfile(c.env.DB, user.id, client.id) : null;
+  const claims = user ? oidcClaims(user, clientProfile) : null;
   return withCors(
     c,
     c.json({
       client: {
         id: client.id,
         name: client.name,
+        logoUrl: client.logo_url,
+        appUrl: client.app_url,
         redirectUri: params.get("redirect_uri"),
         scopes: normalizeScopes(params.get("scope") ?? "openid")
       },
       user: user
         ? {
-            email: user.email,
-            displayName: user.display_name
+            username: claims?.preferred_username ?? user.username,
+            email: claims?.email ?? user.email,
+            displayName: claims?.name ?? user.display_name,
+            nickname: claims?.nickname ?? user.nickname,
+            avatarUrl: claims?.picture ?? user.avatar_url,
+            emailVerified: claims?.email_verified ?? Boolean(user.email_verified)
+          }
+        : null,
+      clientProfile: clientProfile
+        ? {
+            username: clientProfile.username,
+            email: clientProfile.email,
+            displayName: clientProfile.display_name,
+            nickname: clientProfile.nickname,
+            avatarUrl: clientProfile.avatar_url,
+            emailVerified: Boolean(clientProfile.email_verified_at)
           }
         : null
     })
   );
+});
+
+app.get("/api/auth/login-context", async (c) => {
+  const url = new URL(c.req.url);
+  const returnTo = url.searchParams.get("return_to") ?? "";
+  const clientId = url.searchParams.get("client_id") ?? "";
+  const context = await getLoginContext(c.env.DB, c.env.ISSUER, returnTo, clientId);
+  return withCors(c, c.json(context));
 });
 
 app.post("/api/oauth/authorize/confirm", async (c) => {
@@ -522,8 +583,14 @@ app.get("/oauth/userinfo", async (c) => {
       id: payload.sub,
       sub: payload.sub,
       email: payload.email,
-      email_verified: true,
-      name: payload.name
+      email_verified: Boolean(payload.email_verified),
+      name: payload.name,
+      preferred_username: payload.preferred_username,
+      nickname: payload.nickname,
+      gender: payload.gender,
+      birthdate: payload.birthdate,
+      picture: payload.picture,
+      ...(Array.isArray(payload.roles) ? { roles: payload.roles } : {})
     });
   } catch {
     return oauthError(c, "invalid_token", "Token 无效。", 401);
@@ -536,15 +603,19 @@ app.post("/oauth/logout", async (c) => handleOidcLogout(c));
 async function handleOidcLogout(c: AppContext): Promise<Response> {
   const url = new URL(c.req.url);
   const sessionId = getCookie(c, sessionCookie);
+  const session = sessionId ? await getCurrentSession(c.env.DB, sessionId) : null;
+  const fallback = await defaultPostLogoutRedirect(c.env.DB, c.env.ISSUER, session);
   if (sessionId) {
     await c.env.DB.prepare("DELETE FROM sessions WHERE id = ?").bind(sessionId).run();
   }
   deleteCookie(c, sessionCookie, { path: "/" });
 
   const redirectTo = await safePostLogoutRedirect(c.env.DB, {
-    clientId: url.searchParams.get("client_id") ?? undefined,
+    clientId: url.searchParams.get("client_id") ?? getClientIdFromIdTokenHint(url.searchParams.get("id_token_hint")) ?? undefined,
     postLogoutRedirectUri: url.searchParams.get("post_logout_redirect_uri") ?? undefined,
-    issuer: c.env.ISSUER
+    issuer: c.env.ISSUER,
+    state: url.searchParams.get("state") ?? undefined,
+    fallback
   });
   return c.redirect(redirectTo);
 }
@@ -589,7 +660,7 @@ async function handleAuthorizationCodeGrant(
   const tokens = await issueOidcTokens({
     env: c.env,
     user,
-    clientId: client.id,
+    client,
     scope: authCode.scope,
     nonce: authCode.nonce ?? undefined
   });
@@ -634,7 +705,7 @@ async function handleRefreshTokenGrant(
   const tokens = await issueOidcTokens({
     env: c.env,
     user,
-    clientId: client.id,
+    client,
     scope: tokenRecord.scope
   });
 
@@ -662,7 +733,7 @@ app.post("/api/login", async (c) => {
 
     const normalizedLoginId = loginId.toLowerCase();
     const row = await c.env.DB.prepare(
-      "SELECT id, username, email, display_name, password_hash, email_verified, is_admin, is_active FROM users WHERE email = ? OR username = ?"
+      "SELECT id, username, email, display_name, nickname, gender, birthday, avatar_url, password_hash, email_verified, is_admin, is_active FROM users WHERE email = ? OR username = ?"
     )
       .bind(normalizedLoginId, normalizedLoginId)
       .first<User & { password_hash: string }>();
@@ -680,7 +751,21 @@ app.post("/api/login", async (c) => {
 });
 
 app.post("/api/auth/email/start", async (c) => {
-  const { email, username } = await c.req.json<{ email?: string; username?: string }>();
+  const systemSettings = await getSystemSettings(c.env.DB);
+  if (!systemSettings.registrationEnabled) {
+    return withCors(c, c.json({ error: "系统暂未开放注册。" }, 403));
+  }
+
+  const { email, username, clientId } = await c.req.json<{ email?: string; username?: string; clientId?: string }>();
+
+  // 检查应用级注册开关
+  if (clientId) {
+    const client = await getClient(c.env.DB, clientId);
+    if (client && !client.allow_registration) {
+      return withCors(c, c.json({ error: "该应用暂未开放注册。" }, 403));
+    }
+  }
+
   const normalizedEmail = normalizeEmail(email);
   const normalizedUsername = normalizeUsername(username);
   if (!normalizedEmail) {
@@ -748,13 +833,28 @@ app.post("/api/auth/email/start", async (c) => {
 });
 
 app.post("/api/auth/email/verify", async (c) => {
-  const { username, password, email, code, returnTo } = await c.req.json<{
+  const systemSettings = await getSystemSettings(c.env.DB);
+  if (!systemSettings.registrationEnabled) {
+    return withCors(c, c.json({ error: "系统暂未开放注册。" }, 403));
+  }
+
+  const { username, password, email, code, returnTo, clientId } = await c.req.json<{
     username?: string;
     password?: string;
     email?: string;
     code?: string;
     returnTo?: string;
+    clientId?: string;
   }>();
+
+  // 检查应用级注册开关
+  if (clientId) {
+    const client = await getClient(c.env.DB, clientId);
+    if (client && !client.allow_registration) {
+      return withCors(c, c.json({ error: "该应用暂未开放注册。" }, 403));
+    }
+  }
+
   const normalizedEmail = normalizeEmail(email);
   const normalizedUsername = normalizeUsername(username);
   const normalizedCode = normalizeCode(code);
@@ -828,6 +928,128 @@ app.post("/api/auth/email/verify", async (c) => {
   return withCors(c, c.json({ ok: true, redirectTo: safeReturnTo(returnTo ?? emailCode.return_to ?? undefined, c.env.ISSUER) }));
 });
 
+app.post("/api/auth/password/reset/start", async (c) => {
+  const { email } = await c.req.json<{ email?: string }>();
+  const normalizedEmail = normalizeEmail(email);
+  if (!normalizedEmail) {
+    return withCors(c, c.json({ error: "请输入有效邮箱。" }, 400));
+  }
+
+  const rateLimitError = await checkEmailCodeRateLimit(c.env.DB, "reset_password", normalizedEmail);
+  if (rateLimitError) {
+    await recordAuditEvent(c, {
+      actorType: "anonymous",
+      eventType: "email_code_rate_limited",
+      targetType: "email",
+      targetId: normalizedEmail,
+      metadata: { purpose: "reset_password", reason: rateLimitError }
+    });
+    return withCors(c, c.json({ error: rateLimitError }, 429));
+  }
+
+  const user = await c.env.DB.prepare("SELECT id, is_active FROM users WHERE email = ?")
+    .bind(normalizedEmail)
+    .first<{ id: string; is_active: number }>();
+  if (!user?.is_active) {
+    await recordAuditEvent(c, {
+      actorType: "anonymous",
+      eventType: "password_reset_requested",
+      targetType: "email",
+      targetId: normalizedEmail,
+      metadata: { delivered: false }
+    });
+    return withCors(c, c.json({ ok: true, expiresIn: emailCodeMaxAgeSeconds }));
+  }
+
+  const emailDelivery = await getEmailDeliveryConfig(c.env);
+  if (!emailDelivery) {
+    return withCors(c, c.json({ error: "邮件发送尚未配置，请先联系管理员。" }, 400));
+  }
+
+  const code = createNumericCode();
+  const nowIso = new Date().toISOString();
+  await c.env.DB.prepare(
+    `INSERT INTO email_verification_codes
+      (id, purpose, email, code_hash, user_id, expires_at, created_at)
+      VALUES (?, 'reset_password', ?, ?, ?, ?, ?)`
+  )
+    .bind(
+      crypto.randomUUID(),
+      normalizedEmail,
+      await hashEmailCode(code),
+      user.id,
+      nowSeconds() + emailCodeMaxAgeSeconds,
+      nowIso
+    )
+    .run();
+
+  const deliveryResult = await sendVerificationEmail(emailDelivery, normalizedEmail, code, "找回密码验证码");
+  await recordAuditEvent(c, {
+    actorType: "anonymous",
+    eventType: "email_code_sent",
+    targetType: "email",
+    targetId: normalizedEmail,
+    metadata: { purpose: "reset_password", provider: emailDelivery.provider, deliveryId: deliveryResult.id }
+  });
+  return withCors(c, c.json({ ok: true, expiresIn: emailCodeMaxAgeSeconds }));
+});
+
+app.post("/api/auth/password/reset/verify", async (c) => {
+  const { email, code, password } = await c.req.json<{ email?: string; code?: string; password?: string }>();
+  const normalizedEmail = normalizeEmail(email);
+  const normalizedCode = normalizeCode(code);
+  const passwordError = validatePassword(password);
+  if (passwordError) {
+    return withCors(c, c.json({ error: passwordError }, 400));
+  }
+  if (!normalizedEmail || !normalizedCode) {
+    return withCors(c, c.json({ error: "请输入邮箱和 6 位验证码。" }, 400));
+  }
+
+  const emailCode = await getActiveEmailCode(c.env.DB, "reset_password", normalizedEmail);
+  if (!emailCode) {
+    return withCors(c, c.json({ error: "验证码不存在或已过期。" }, 400));
+  }
+  if (emailCode.attempts >= 5) {
+    return withCors(c, c.json({ error: "验证码尝试次数过多，请重新发送。" }, 429));
+  }
+  if (!(await verifyEmailCode(normalizedCode, emailCode.code_hash))) {
+    await c.env.DB.prepare("UPDATE email_verification_codes SET attempts = attempts + 1 WHERE id = ?")
+      .bind(emailCode.id)
+      .run();
+    return withCors(c, c.json({ error: "验证码错误。" }, 400));
+  }
+
+  const user = await c.env.DB.prepare("SELECT id, is_active FROM users WHERE email = ?")
+    .bind(normalizedEmail)
+    .first<{ id: string; is_active: number }>();
+  if (!user?.is_active || emailCode.user_id !== user.id) {
+    return withCors(c, c.json({ error: "账号不存在或不可用。" }, 400));
+  }
+
+  const nowIso = new Date().toISOString();
+  await c.env.DB.batch([
+    c.env.DB.prepare("UPDATE users SET password_hash = ?, password_salt = ?, updated_at = ? WHERE id = ?").bind(
+      await hashPassword(password ?? ""),
+      "embedded",
+      nowIso,
+      user.id
+    ),
+    c.env.DB.prepare("UPDATE email_verification_codes SET consumed_at = ? WHERE id = ?").bind(nowIso, emailCode.id),
+    c.env.DB.prepare("DELETE FROM sessions WHERE user_id = ?").bind(user.id),
+    c.env.DB.prepare("UPDATE refresh_tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL").bind(nowIso, user.id)
+  ]);
+  await recordAuditEvent(c, {
+    actorType: "user",
+    actorId: user.id,
+    eventType: "password_reset_by_email",
+    targetType: "user",
+    targetId: user.id
+  });
+
+  return withCors(c, c.json({ ok: true }));
+});
+
 app.get("/api/me", async (c) => {
   const session = await getCurrentSession(c.env.DB, getCookie(c, sessionCookie));
   if (!session) {
@@ -846,11 +1068,60 @@ app.get("/api/me", async (c) => {
         username: user.username,
         email: user.email,
         displayName: user.display_name,
+        nickname: user.nickname,
+        gender: user.gender,
+        birthday: user.birthday,
+        avatarUrl: user.avatar_url,
         emailVerified: Boolean(user.email_verified),
         isAdmin: Boolean(user.is_admin)
       }
     })
   );
+});
+
+app.post("/api/account/profile", async (c) => {
+  const session = await getCurrentSession(c.env.DB, getCookie(c, sessionCookie));
+  if (!session) {
+    return withCors(c, c.json({ error: "请先登录。" }, 401));
+  }
+
+  const body = await c.req.json<{
+    displayName?: string;
+    nickname?: string;
+    gender?: string;
+    birthday?: string;
+    avatarUrl?: string;
+  }>();
+  const displayName = normalizeOptionalText(body.displayName, 80);
+  const nickname = normalizeOptionalText(body.nickname, 80);
+  const gender = normalizeGender(body.gender);
+  const birthday = normalizeBirthday(body.birthday);
+  const avatarUrl = normalizeOptionalUrl(body.avatarUrl);
+
+  if (body.gender && gender === undefined) {
+    return withCors(c, c.json({ error: "请选择有效性别。" }, 400));
+  }
+  if (body.birthday && birthday === undefined) {
+    return withCors(c, c.json({ error: "生日格式应为 YYYY-MM-DD。" }, 400));
+  }
+  if (body.avatarUrl && avatarUrl === undefined) {
+    return withCors(c, c.json({ error: "头像地址需为 http 或 https 链接。" }, 400));
+  }
+
+  await c.env.DB.prepare(
+    "UPDATE users SET display_name = COALESCE(?, display_name), nickname = ?, gender = ?, birthday = ?, avatar_url = ?, updated_at = ? WHERE id = ?"
+  )
+    .bind(displayName, nickname, gender ?? null, birthday ?? null, avatarUrl ?? null, new Date().toISOString(), session.user_id)
+    .run();
+  await recordAuditEvent(c, {
+    actorType: "user",
+    actorId: session.user_id,
+    eventType: "profile_updated",
+    targetType: "user",
+    targetId: session.user_id,
+    metadata: { hasNickname: Boolean(nickname), hasAvatar: Boolean(avatarUrl) }
+  });
+  return withCors(c, c.json({ ok: true }));
 });
 
 app.post("/api/account/email/start", async (c) => {
@@ -942,8 +1213,7 @@ app.post("/api/account/email/verify", async (c) => {
   }
 
   await c.env.DB.batch([
-    c.env.DB.prepare("UPDATE users SET email = ?, display_name = ?, email_verified = 1, updated_at = ? WHERE id = ?").bind(
-      normalizedEmail,
+    c.env.DB.prepare("UPDATE users SET email = ?, email_verified = 1, updated_at = ? WHERE id = ?").bind(
       normalizedEmail,
       new Date().toISOString(),
       session.user_id
@@ -1006,6 +1276,275 @@ app.post("/api/account/password", async (c) => {
   return withCors(c, c.json({ ok: true }));
 });
 
+app.get("/api/account/client-profiles", async (c) => {
+  const session = await getCurrentSession(c.env.DB, getCookie(c, sessionCookie));
+  if (!session) {
+    return withCors(c, c.json({ error: "请先登录。" }, 401));
+  }
+
+  const url = new URL(c.req.url);
+  const page = Math.max(Number(url.searchParams.get("page") ?? 1), 1);
+  const pageSize = Math.min(Math.max(Number(url.searchParams.get("pageSize") ?? 10), 1), 100);
+  const offset = (page - 1) * pageSize;
+
+  const total = await c.env.DB.prepare(
+    "SELECT COUNT(*) as count FROM clients WHERE is_active = 1"
+  ).first<{ count: number }>();
+
+  console.log("Total count from DB:", total?.count);
+
+  const { results } = await c.env.DB.prepare(
+    `SELECT
+       clients.id AS client_id,
+       clients.name AS client_name,
+       clients.logo_url AS client_logo_url,
+       clients.app_url AS client_app_url,
+       user_client_profiles.id AS profile_id,
+       user_client_profiles.username,
+       user_client_profiles.email,
+       user_client_profiles.display_name,
+       user_client_profiles.nickname,
+       user_client_profiles.avatar_url,
+       user_client_profiles.email_verified_at,
+       user_client_profiles.updated_at
+     FROM clients
+     LEFT JOIN user_client_profiles
+       ON user_client_profiles.client_id = clients.id
+      AND user_client_profiles.user_id = ?
+     WHERE clients.is_active = 1
+     ORDER BY clients.name COLLATE NOCASE ASC
+     LIMIT ? OFFSET ?`
+  )
+    .bind(session.user_id, pageSize, offset)
+    .all<{
+      client_id: string;
+      client_name: string;
+      client_logo_url: string | null;
+      client_app_url: string | null;
+      profile_id: string | null;
+      username: string | null;
+      email: string | null;
+      display_name: string | null;
+      nickname: string | null;
+      avatar_url: string | null;
+      email_verified_at: string | null;
+      updated_at: string | null;
+    }>();
+
+  const response = {
+    page,
+    pageSize,
+    total: total?.count ?? 0,
+    profiles: results.map((item) => ({
+      clientId: item.client_id,
+      clientName: item.client_name,
+      clientLogoUrl: item.client_logo_url,
+      clientAppUrl: item.client_app_url,
+      configured: Boolean(item.profile_id),
+      username: item.username,
+      email: item.email,
+      displayName: item.display_name,
+      nickname: item.nickname,
+      avatarUrl: item.avatar_url,
+      emailVerified: Boolean(item.email_verified_at),
+      updatedAt: item.updated_at
+    }))
+  };
+
+  console.log("Response data:", JSON.stringify({ page: response.page, pageSize: response.pageSize, total: response.total, profilesCount: response.profiles.length }));
+
+  return withCors(c, c.json(response));
+});
+
+app.post("/api/account/client-profiles/:clientId", async (c) => {
+  const session = await getCurrentSession(c.env.DB, getCookie(c, sessionCookie));
+  if (!session) {
+    return withCors(c, c.json({ error: "请先登录。" }, 401));
+  }
+  const clientId = c.req.param("clientId");
+  const client = await getClient(c.env.DB, clientId);
+  if (!client || !client.is_active) {
+    return withCors(c, c.json({ error: "应用不存在或已停用。" }, 404));
+  }
+
+  const body = await c.req.json<{
+    username?: string;
+    email?: string;
+    displayName?: string;
+    nickname?: string;
+    avatarUrl?: string;
+  }>();
+  const username = normalizeProfileUsername(body.username);
+  const email = normalizeEmail(body.email);
+  const displayName = normalizeOptionalText(body.displayName, 80);
+  const nickname = normalizeOptionalText(body.nickname, 80);
+  const avatarUrl = normalizeOptionalUrl(body.avatarUrl);
+  if (body.username && username === undefined) {
+    return withCors(c, c.json({ error: "应用用户名需为 2-64 位字母、数字、下划线、短横线、点号或 @。" }, 400));
+  }
+  if (body.email && !email) {
+    return withCors(c, c.json({ error: "请输入有效邮箱。" }, 400));
+  }
+  if (body.avatarUrl && avatarUrl === undefined) {
+    return withCors(c, c.json({ error: "头像 URL 必须是 http 或 https 地址。" }, 400));
+  }
+
+  const existing = await getUserClientProfile(c.env.DB, session.user_id, clientId);
+  const currentUser = await getUserById(c.env.DB, session.user_id);
+  const emailVerifiedAt = resolveClientProfileEmailVerifiedAt({
+    nextEmail: email,
+    previousEmail: existing?.email ?? null,
+    previousVerifiedAt: existing?.email_verified_at ?? null,
+    mainEmail: currentUser?.email ?? "",
+    mainEmailVerified: Boolean(currentUser?.email_verified)
+  });
+  const nowIso = new Date().toISOString();
+  await c.env.DB.prepare(
+    `INSERT INTO user_client_profiles
+      (id, user_id, client_id, username, email, display_name, nickname, avatar_url, email_verified_at, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(user_id, client_id) DO UPDATE SET
+        username = excluded.username,
+        email = excluded.email,
+        display_name = excluded.display_name,
+        nickname = excluded.nickname,
+        avatar_url = excluded.avatar_url,
+        email_verified_at = excluded.email_verified_at,
+        updated_at = excluded.updated_at`
+  )
+    .bind(
+      existing?.id ?? crypto.randomUUID(),
+      session.user_id,
+      clientId,
+      username ?? null,
+      email ?? null,
+      displayName,
+      nickname,
+      avatarUrl ?? null,
+      emailVerifiedAt,
+      existing?.created_at ?? nowIso,
+      nowIso
+    )
+    .run();
+
+  await recordAuditEvent(c, {
+    actorType: "user",
+    actorId: session.user_id,
+    eventType: "client_profile_updated",
+    targetType: "client",
+    targetId: clientId,
+    metadata: { hasEmail: Boolean(email), emailVerified: Boolean(emailVerifiedAt) }
+  });
+
+  return withCors(c, c.json({ ok: true }));
+});
+
+app.post("/api/account/client-profiles/:clientId/email/start", async (c) => {
+  const session = await getCurrentSession(c.env.DB, getCookie(c, sessionCookie));
+  if (!session) {
+    return withCors(c, c.json({ error: "请先登录。" }, 401));
+  }
+  const clientId = c.req.param("clientId");
+  const client = await getClient(c.env.DB, clientId);
+  if (!client || !client.is_active) {
+    return withCors(c, c.json({ error: "应用不存在或已停用。" }, 404));
+  }
+  const { email } = await c.req.json<{ email?: string }>();
+  const normalizedEmail = normalizeEmail(email);
+  if (!normalizedEmail) {
+    return withCors(c, c.json({ error: "请输入有效邮箱。" }, 400));
+  }
+  const rateLimitError = await checkEmailCodeRateLimit(c.env.DB, "bind_email", normalizedEmail, session.user_id);
+  if (rateLimitError) {
+    return withCors(c, c.json({ error: rateLimitError }, 429));
+  }
+  const emailDelivery = await getEmailDeliveryConfig(c.env);
+  if (!emailDelivery) {
+    return withCors(c, c.json({ error: "邮件发送尚未配置。" }, 400));
+  }
+
+  const code = createNumericCode();
+  await c.env.DB.prepare(
+    `INSERT INTO email_verification_codes
+      (id, purpose, email, code_hash, user_id, expires_at, created_at)
+      VALUES (?, 'bind_email', ?, ?, ?, ?, ?)`
+  )
+    .bind(
+      crypto.randomUUID(),
+      normalizedEmail,
+      await hashEmailCode(code),
+      session.user_id,
+      nowSeconds() + emailCodeMaxAgeSeconds,
+      new Date().toISOString()
+    )
+    .run();
+  const deliveryResult = await sendVerificationEmail(emailDelivery, normalizedEmail, code, `${client.name} 邮箱验证码`);
+  await recordAuditEvent(c, {
+    actorType: "user",
+    actorId: session.user_id,
+    eventType: "email_code_sent",
+    targetType: "client",
+    targetId: clientId,
+    metadata: { purpose: "client_profile_email", email: normalizedEmail, provider: emailDelivery.provider, deliveryId: deliveryResult.id }
+  });
+  return withCors(c, c.json({ ok: true, expiresIn: emailCodeMaxAgeSeconds }));
+});
+
+app.post("/api/account/client-profiles/:clientId/email/verify", async (c) => {
+  const session = await getCurrentSession(c.env.DB, getCookie(c, sessionCookie));
+  if (!session) {
+    return withCors(c, c.json({ error: "请先登录。" }, 401));
+  }
+  const clientId = c.req.param("clientId");
+  const client = await getClient(c.env.DB, clientId);
+  if (!client || !client.is_active) {
+    return withCors(c, c.json({ error: "应用不存在或已停用。" }, 404));
+  }
+  const { email, code } = await c.req.json<{ email?: string; code?: string }>();
+  const normalizedEmail = normalizeEmail(email);
+  const normalizedCode = normalizeCode(code);
+  if (!normalizedEmail || !normalizedCode) {
+    return withCors(c, c.json({ error: "请输入邮箱和 6 位验证码。" }, 400));
+  }
+  const emailCode = await getActiveEmailCode(c.env.DB, "bind_email", normalizedEmail, session.user_id);
+  if (!emailCode) {
+    return withCors(c, c.json({ error: "验证码不存在或已过期。" }, 400));
+  }
+  if (emailCode.attempts >= 5) {
+    return withCors(c, c.json({ error: "验证码尝试次数过多，请重新发送。" }, 429));
+  }
+  if (!(await verifyEmailCode(normalizedCode, emailCode.code_hash))) {
+    await c.env.DB.prepare("UPDATE email_verification_codes SET attempts = attempts + 1 WHERE id = ?")
+      .bind(emailCode.id)
+      .run();
+    return withCors(c, c.json({ error: "验证码错误。" }, 400));
+  }
+
+  const existing = await getUserClientProfile(c.env.DB, session.user_id, clientId);
+  const nowIso = new Date().toISOString();
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      `INSERT INTO user_client_profiles
+        (id, user_id, client_id, email, email_verified_at, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(user_id, client_id) DO UPDATE SET
+          email = excluded.email,
+          email_verified_at = excluded.email_verified_at,
+          updated_at = excluded.updated_at`
+    ).bind(existing?.id ?? crypto.randomUUID(), session.user_id, clientId, normalizedEmail, nowIso, existing?.created_at ?? nowIso, nowIso),
+    c.env.DB.prepare("UPDATE email_verification_codes SET consumed_at = ? WHERE id = ?").bind(nowIso, emailCode.id)
+  ]);
+  await recordAuditEvent(c, {
+    actorType: "user",
+    actorId: session.user_id,
+    eventType: "client_profile_email_verified",
+    targetType: "client",
+    targetId: clientId,
+    metadata: { email: normalizedEmail }
+  });
+  return withCors(c, c.json({ ok: true }));
+});
+
 app.get("/api/account/grants", async (c) => {
   const session = await getCurrentSession(c.env.DB, getCookie(c, sessionCookie));
   if (!session) {
@@ -1017,6 +1556,8 @@ app.get("/api/account/grants", async (c) => {
       oauth_grants.id,
       oauth_grants.client_id,
       clients.name AS client_name,
+      clients.logo_url AS client_logo_url,
+      clients.app_url AS client_app_url,
       oauth_grants.scope,
       oauth_grants.last_redirect_uri,
       oauth_grants.granted_at,
@@ -1036,6 +1577,8 @@ app.get("/api/account/grants", async (c) => {
         id: grant.id,
         clientId: grant.client_id,
         clientName: grant.client_name,
+        clientLogoUrl: grant.client_logo_url,
+        clientAppUrl: grant.client_app_url,
         scopes: normalizeScopes(grant.scope),
         lastRedirectUri: grant.last_redirect_uri,
         grantedAt: grant.granted_at,
@@ -1102,7 +1645,9 @@ app.get("/api/account/sessions", async (c) => {
        sessions.last_seen_at,
        sessions.expires_at,
        sessions.client_id,
-       clients.name AS client_name
+       clients.name AS client_name,
+       clients.logo_url AS client_logo_url,
+       clients.app_url AS client_app_url
      FROM sessions
      LEFT JOIN clients ON clients.id = sessions.client_id
      WHERE sessions.user_id = ?
@@ -1128,6 +1673,8 @@ app.get("/api/account/sessions", async (c) => {
       expires_at: number;
       client_id: string | null;
       client_name: string | null;
+      client_logo_url: string | null;
+      client_app_url: string | null;
     }>();
 
   return withCors(
@@ -1140,6 +1687,8 @@ app.get("/api/account/sessions", async (c) => {
         userAgent: item.user_agent,
         sourceId: item.client_id,
         sourceName: item.client_name ?? "控制台",
+        sourceLogoUrl: item.client_logo_url,
+        sourceAppUrl: item.client_app_url,
         createdAt: item.created_at,
         lastSeenAt: item.last_seen_at,
         expiresAt: item.expires_at
@@ -1197,6 +1746,55 @@ app.get("/api/admin/smtp", async (c) => {
       smtp: publicConfig
     })
   );
+});
+
+app.get("/api/admin/settings", async (c) => {
+  const admin = await requireAdmin(c);
+  if ("response" in admin) {
+    return admin.response;
+  }
+  const [system, publicConfig, deliverySettings] = await Promise.all([
+    getSystemSettings(c.env.DB),
+    getPublicSmtpConfig(c.env.DB, c.env.OIDC_PRIVATE_JWK),
+    getEmailDeliverySettings(c.env.DB)
+  ]);
+  return withCors(
+    c,
+    c.json({
+      system,
+      email: {
+        configured: deliverySettings.provider === "resend" ? Boolean(c.env.RESEND_API_KEY) : Boolean(publicConfig),
+        provider: deliverySettings.provider,
+        resendConfigured: Boolean(c.env.RESEND_API_KEY),
+        resend: {
+          fromEmail: deliverySettings.resendFromEmail,
+          fromName: deliverySettings.resendFromName
+        },
+        smtp: publicConfig
+      }
+    })
+  );
+});
+
+app.post("/api/admin/settings", async (c) => {
+  const admin = await requireAdmin(c);
+  if ("response" in admin) {
+    return admin.response;
+  }
+  const body = await c.req.json<Partial<SystemSettings>>();
+  const settings = validateSystemSettings(body);
+  if ("error" in settings) {
+    return withCors(c, c.json({ error: settings.error }, 400));
+  }
+  await saveSystemSettings(c.env.DB, settings);
+  await recordAuditEvent(c, {
+    actorType: "admin",
+    actorId: admin.user?.id,
+    eventType: "system_settings_updated",
+    targetType: "system",
+    metadata: { registrationEnabled: settings.registrationEnabled }
+  });
+  return withCors(c, c.json({ ok: true }));
 });
 
 app.post("/api/admin/smtp", async (c) => {
@@ -1276,6 +1874,13 @@ app.get("/api/admin/clients", async (c) => {
     return admin.response;
   }
 
+  const url = new URL(c.req.url);
+  const page = Math.max(Number(url.searchParams.get("page") ?? 1), 1);
+  const pageSize = Math.min(Math.max(Number(url.searchParams.get("pageSize") ?? 10), 1), 100);
+  const offset = (page - 1) * pageSize;
+
+  const total = await c.env.DB.prepare("SELECT COUNT(*) as count FROM clients").first<{ count: number }>();
+
   const { results } = await c.env.DB.prepare(
     `SELECT
       id,
@@ -1284,15 +1889,26 @@ app.get("/api/admin/clients", async (c) => {
       allowed_scopes,
       secret_hash,
       client_secret_encrypted,
+      logo_url,
+      app_url,
       COALESCE(pkce_required, 1) AS pkce_required,
+      COALESCE(return_roles, 0) AS return_roles,
+      COALESCE(allow_registration, 1) AS allow_registration,
       is_active,
       created_at
      FROM clients
-     ORDER BY created_at DESC`
-  ).all<Client>();
+     ORDER BY created_at DESC
+     LIMIT ? OFFSET ?`
+  )
+    .bind(pageSize, offset)
+    .all<Client>();
+
   return withCors(
     c,
     c.json({
+      page,
+      pageSize,
+      total: total?.count ?? 0,
       clients: results.map((client) => ({
         id: client.id,
         name: client.name,
@@ -1300,7 +1916,11 @@ app.get("/api/admin/clients", async (c) => {
         allowedScopes: parseJsonArray(client.allowed_scopes),
         confidential: Boolean(client.secret_hash),
         secretRevealable: Boolean(client.client_secret_encrypted),
+        logoUrl: client.logo_url,
+        appUrl: client.app_url,
         pkceRequired: client.pkce_required === 1,
+        returnRoles: client.return_roles === 1,
+        allowRegistration: client.allow_registration === 1,
         active: Boolean(client.is_active),
         createdAt: client.created_at
       }))
@@ -1319,15 +1939,27 @@ app.post("/api/admin/clients", async (c) => {
     name?: string;
     redirectUris?: string[];
     allowedScopes?: string[];
+    logoUrl?: string;
+    appUrl?: string;
     confidential?: boolean;
     pkceRequired?: boolean;
+    returnRoles?: boolean;
+    allowRegistration?: boolean;
   }>();
   const clientId = normalizeClientId(body.id);
   const name = body.name?.trim();
+  const logoUrl = normalizeOptionalUrl(body.logoUrl);
+  const appUrl = normalizeOptionalUrl(body.appUrl);
   const redirectUris = normalizeRedirectUris(body.redirectUris);
   const allowedScopes = normalizeAllowedScopes(body.allowedScopes);
   if (!clientId || !name || redirectUris.length === 0) {
     return withCors(c, c.json({ error: "请填写应用 ID、名称和至少一个回调地址。" }, 400));
+  }
+  if (body.logoUrl && logoUrl === undefined) {
+    return withCors(c, c.json({ error: "应用 Logo 地址需为 http 或 https 链接。" }, 400));
+  }
+  if (body.appUrl && appUrl === undefined) {
+    return withCors(c, c.json({ error: "应用网址需为 http 或 https 链接。" }, 400));
   }
 
   const existing = await c.env.DB.prepare("SELECT id FROM clients WHERE id = ?").bind(clientId).first<{ id: string }>();
@@ -1336,9 +1968,11 @@ app.post("/api/admin/clients", async (c) => {
   }
 
   const clientSecret = body.confidential === false ? null : createToken(32);
-  const pkceRequired = clientSecret ? body.pkceRequired !== false : true;
+  const pkceRequired = false;
+  const returnRoles = Boolean(body.returnRoles);
+  const allowRegistration = body.allowRegistration !== false;
   await c.env.DB.prepare(
-    "INSERT INTO clients (id, name, redirect_uris, allowed_scopes, secret_hash, client_secret_encrypted, pkce_required, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+    "INSERT INTO clients (id, name, redirect_uris, allowed_scopes, secret_hash, client_secret_encrypted, logo_url, app_url, pkce_required, return_roles, allow_registration, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
   )
     .bind(
       clientId,
@@ -1347,7 +1981,11 @@ app.post("/api/admin/clients", async (c) => {
       JSON.stringify(allowedScopes),
       clientSecret ? await hashPassword(clientSecret) : null,
       clientSecret ? await encryptSecret(c.env.OIDC_PRIVATE_JWK, clientSecret) : null,
+      logoUrl ?? null,
+      appUrl ?? null,
       pkceRequired ? 1 : 0,
+      returnRoles ? 1 : 0,
+      allowRegistration ? 1 : 0,
       new Date().toISOString()
     )
     .run();
@@ -1358,7 +1996,7 @@ app.post("/api/admin/clients", async (c) => {
     eventType: "client_created",
     targetType: "client",
     targetId: clientId,
-    metadata: { name, redirectUris, allowedScopes, confidential: Boolean(clientSecret), pkceRequired }
+    metadata: { name, redirectUris, allowedScopes, confidential: Boolean(clientSecret), pkceRequired, returnRoles, allowRegistration }
   });
   return withCors(
     c,
@@ -1371,7 +2009,11 @@ app.post("/api/admin/clients", async (c) => {
         allowedScopes,
         confidential: Boolean(clientSecret),
         secretRevealable: Boolean(clientSecret),
+        logoUrl: logoUrl ?? null,
+        appUrl: appUrl ?? null,
         pkceRequired,
+        returnRoles,
+        allowRegistration,
         active: true
       },
       clientSecret
@@ -1390,24 +2032,38 @@ app.post("/api/admin/clients/:id", async (c) => {
     name?: string;
     redirectUris?: string[];
     allowedScopes?: string[];
+    logoUrl?: string;
+    appUrl?: string;
     pkceRequired?: boolean;
+    returnRoles?: boolean;
+    allowRegistration?: boolean;
   }>();
   const name = body.name?.trim();
+  const logoUrl = normalizeOptionalUrl(body.logoUrl);
+  const appUrl = normalizeOptionalUrl(body.appUrl);
   const redirectUris = normalizeRedirectUris(body.redirectUris);
   const allowedScopes = normalizeAllowedScopes(body.allowedScopes);
   if (!name || redirectUris.length === 0) {
     return withCors(c, c.json({ error: "请填写应用名称和至少一个回调地址。" }, 400));
+  }
+  if (body.logoUrl && logoUrl === undefined) {
+    return withCors(c, c.json({ error: "应用 Logo 地址需为 http 或 https 链接。" }, 400));
+  }
+  if (body.appUrl && appUrl === undefined) {
+    return withCors(c, c.json({ error: "应用网址需为 http 或 https 链接。" }, 400));
   }
 
   const client = await getClient(c.env.DB, clientId);
   if (!client) {
     return withCors(c, c.json({ error: "应用不存在。" }, 404));
   }
-  const pkceRequired = client.secret_hash ? body.pkceRequired !== false : true;
+  const pkceRequired = false;
+  const returnRoles = Boolean(body.returnRoles);
+  const allowRegistration = body.allowRegistration !== false;
   const result = await c.env.DB.prepare(
-    "UPDATE clients SET name = ?, redirect_uris = ?, allowed_scopes = ?, pkce_required = ? WHERE id = ?"
+    "UPDATE clients SET name = ?, redirect_uris = ?, allowed_scopes = ?, logo_url = ?, app_url = ?, pkce_required = ?, return_roles = ?, allow_registration = ? WHERE id = ?"
   )
-    .bind(name, JSON.stringify(redirectUris), JSON.stringify(allowedScopes), pkceRequired ? 1 : 0, clientId)
+    .bind(name, JSON.stringify(redirectUris), JSON.stringify(allowedScopes), logoUrl ?? null, appUrl ?? null, pkceRequired ? 1 : 0, returnRoles ? 1 : 0, allowRegistration ? 1 : 0, clientId)
     .run();
   if (result.meta.changes === 0) {
     return withCors(c, c.json({ error: "应用不存在。" }, 404));
@@ -1419,7 +2075,7 @@ app.post("/api/admin/clients/:id", async (c) => {
     eventType: "client_updated",
     targetType: "client",
     targetId: clientId,
-    metadata: { name, redirectUris, allowedScopes, pkceRequired }
+    metadata: { name, redirectUris, allowedScopes, hasLogo: Boolean(logoUrl), hasAppUrl: Boolean(appUrl), pkceRequired, returnRoles, allowRegistration }
   });
   return withCors(c, c.json({ ok: true }));
 });
@@ -1572,14 +2228,18 @@ app.get("/api/admin/audit-events", async (c) => {
   if ("response" in admin) {
     return admin.response;
   }
-  const limit = Math.min(Number(new URL(c.req.url).searchParams.get("limit") ?? 100), 200);
+  const url = new URL(c.req.url);
+  const page = Math.max(Number(url.searchParams.get("page") ?? 1), 1);
+  const pageSize = Math.min(Math.max(Number(url.searchParams.get("pageSize") ?? 10), 1), 100);
+  const offset = (page - 1) * pageSize;
+  const total = await c.env.DB.prepare("SELECT COUNT(*) as count FROM audit_events").first<{ count: number }>();
   const { results } = await c.env.DB.prepare(
     `SELECT id, actor_type, actor_id, event_type, target_type, target_id, ip, user_agent, metadata, created_at
      FROM audit_events
      ORDER BY created_at DESC
-     LIMIT ?`
+     LIMIT ? OFFSET ?`
   )
-    .bind(limit)
+    .bind(pageSize, offset)
     .all<{
       id: string;
       actor_type: string;
@@ -1595,6 +2255,9 @@ app.get("/api/admin/audit-events", async (c) => {
   return withCors(
     c,
     c.json({
+      page,
+      pageSize,
+      total: total?.count ?? 0,
       events: results.map((event) => ({
         id: event.id,
         actorType: event.actor_type,
@@ -1623,6 +2286,10 @@ app.get("/api/admin/users", async (c) => {
       users.username,
       users.email,
       users.display_name,
+      users.nickname,
+      users.gender,
+      users.birthday,
+      users.avatar_url,
       users.email_verified,
       users.is_admin,
       users.is_active,
@@ -1644,6 +2311,10 @@ app.get("/api/admin/users", async (c) => {
       username: string | null;
       email: string;
       display_name: string;
+      nickname: string | null;
+      gender: string | null;
+      birthday: string | null;
+      avatar_url: string | null;
       email_verified: number;
       is_admin: number;
       is_active: number;
@@ -1660,6 +2331,10 @@ app.get("/api/admin/users", async (c) => {
         username: user.username,
         email: user.email,
         displayName: user.display_name,
+        nickname: user.nickname,
+        gender: user.gender,
+        birthday: user.birthday,
+        avatarUrl: user.avatar_url,
         emailVerified: Boolean(user.email_verified),
         admin: Boolean(user.is_admin),
         active: Boolean(user.is_active),
@@ -1681,11 +2356,19 @@ app.post("/api/admin/users", async (c) => {
     username?: string;
     email?: string;
     displayName?: string;
+    nickname?: string;
+    gender?: string;
+    birthday?: string;
+    avatarUrl?: string;
     password?: string;
     admin?: boolean;
     active?: boolean;
   }>();
   const userInput = normalizeAdminUserInput(body);
+  const nickname = normalizeOptionalText(body.nickname, 80);
+  const gender = normalizeGender(body.gender);
+  const birthday = normalizeBirthday(body.birthday);
+  const avatarUrl = normalizeOptionalUrl(body.avatarUrl);
   const passwordError = validatePassword(body.password);
   if (!userInput.username) {
     return withCors(c, c.json({ error: "用户名需为 3-32 位字母、数字、下划线或短横线。" }, 400));
@@ -1695,6 +2378,15 @@ app.post("/api/admin/users", async (c) => {
   }
   if (passwordError) {
     return withCors(c, c.json({ error: passwordError }, 400));
+  }
+  if (body.gender && gender === undefined) {
+    return withCors(c, c.json({ error: "请选择有效性别。" }, 400));
+  }
+  if (body.birthday && birthday === undefined) {
+    return withCors(c, c.json({ error: "生日格式应为 YYYY-MM-DD。" }, 400));
+  }
+  if (body.avatarUrl && avatarUrl === undefined) {
+    return withCors(c, c.json({ error: "头像地址需为 http 或 https 链接。" }, 400));
   }
 
   const existing = await c.env.DB.prepare("SELECT id FROM users WHERE email = ? OR username = ?")
@@ -1708,14 +2400,18 @@ app.post("/api/admin/users", async (c) => {
   const nowIso = new Date().toISOString();
   await c.env.DB.prepare(
     `INSERT INTO users
-      (id, username, email, display_name, password_hash, password_salt, email_verified, is_admin, is_active, created_at, updated_at)
-      VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)`
+      (id, username, email, display_name, nickname, gender, birthday, avatar_url, password_hash, password_salt, email_verified, is_admin, is_active, created_at, updated_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?)`
   )
     .bind(
       userId,
       userInput.username,
       userInput.email,
       userInput.displayName,
+      nickname,
+      gender ?? null,
+      birthday ?? null,
+      avatarUrl ?? null,
       await hashPassword(body.password ?? ""),
       "embedded",
       body.admin ? 1 : 0,
@@ -1752,15 +2448,32 @@ app.post("/api/admin/users/:id", async (c) => {
     username?: string;
     email?: string;
     displayName?: string;
+    nickname?: string;
+    gender?: string;
+    birthday?: string;
+    avatarUrl?: string;
     admin?: boolean;
     active?: boolean;
   }>();
   const userInput = normalizeAdminUserInput(body);
+  const nickname = normalizeOptionalText(body.nickname, 80);
+  const gender = normalizeGender(body.gender);
+  const birthday = normalizeBirthday(body.birthday);
+  const avatarUrl = normalizeOptionalUrl(body.avatarUrl);
   if (!userInput.username) {
     return withCors(c, c.json({ error: "用户名需为 3-32 位字母、数字、下划线或短横线。" }, 400));
   }
   if (!userInput.email) {
     return withCors(c, c.json({ error: "请输入有效邮箱。" }, 400));
+  }
+  if (body.gender && gender === undefined) {
+    return withCors(c, c.json({ error: "请选择有效性别。" }, 400));
+  }
+  if (body.birthday && birthday === undefined) {
+    return withCors(c, c.json({ error: "生日格式应为 YYYY-MM-DD。" }, 400));
+  }
+  if (body.avatarUrl && avatarUrl === undefined) {
+    return withCors(c, c.json({ error: "头像地址需为 http 或 https 链接。" }, 400));
   }
 
   const duplicate = await c.env.DB.prepare("SELECT id FROM users WHERE (email = ? OR username = ?) AND id != ?")
@@ -1782,8 +2495,8 @@ app.post("/api/admin/users/:id", async (c) => {
   const nowIso = new Date().toISOString();
   const statements = [
     c.env.DB.prepare(
-      "UPDATE users SET username = ?, email = ?, display_name = ?, is_admin = ?, is_active = ?, updated_at = ? WHERE id = ?"
-    ).bind(userInput.username, userInput.email, userInput.displayName, nextAdmin, nextActive, nowIso, userId)
+      "UPDATE users SET username = ?, email = ?, display_name = ?, nickname = ?, gender = ?, birthday = ?, avatar_url = ?, is_admin = ?, is_active = ?, updated_at = ? WHERE id = ?"
+    ).bind(userInput.username, userInput.email, userInput.displayName, nickname, gender ?? null, birthday ?? null, avatarUrl ?? null, nextAdmin, nextActive, nowIso, userId)
   ];
   if (!nextActive) {
     statements.push(c.env.DB.prepare("DELETE FROM sessions WHERE user_id = ?").bind(userId));
@@ -2105,7 +2818,11 @@ async function getClient(db: D1Database, clientId: string): Promise<Client | nul
         allowed_scopes,
         secret_hash,
         client_secret_encrypted,
+        logo_url,
+        app_url,
         COALESCE(pkce_required, 1) AS pkce_required,
+        COALESCE(return_roles, 0) AS return_roles,
+        COALESCE(allow_registration, 1) AS allow_registration,
         is_active,
         created_at
        FROM clients
@@ -2117,15 +2834,26 @@ async function getClient(db: D1Database, clientId: string): Promise<Client | nul
 
 async function getUserById(db: D1Database, userId: string): Promise<User | null> {
   return db
-    .prepare("SELECT id, username, email, display_name, email_verified, is_admin, is_active FROM users WHERE id = ?")
+    .prepare("SELECT id, username, email, display_name, nickname, gender, birthday, avatar_url, email_verified, is_admin, is_active FROM users WHERE id = ?")
     .bind(userId)
     .first<User>();
+}
+
+async function getUserClientProfile(db: D1Database, userId: string, clientId: string): Promise<UserClientProfile | null> {
+  return db
+    .prepare(
+      `SELECT id, user_id, client_id, username, email, display_name, nickname, avatar_url, email_verified_at, created_at, updated_at
+       FROM user_client_profiles
+       WHERE user_id = ? AND client_id = ?`
+    )
+    .bind(userId, clientId)
+    .first<UserClientProfile>();
 }
 
 async function getUserPasswordById(db: D1Database, userId: string): Promise<(User & { password_hash: string }) | null> {
   return db
     .prepare(
-      "SELECT id, username, email, display_name, email_verified, is_admin, is_active, password_hash FROM users WHERE id = ?"
+      "SELECT id, username, email, display_name, nickname, gender, birthday, avatar_url, email_verified, is_admin, is_active, password_hash FROM users WHERE id = ?"
     )
     .bind(userId)
     .first<User & { password_hash: string }>();
@@ -2149,6 +2877,37 @@ function normalizeAdminUserInput(input: { username?: string; email?: string; dis
     email,
     displayName: displayName.slice(0, 80)
   };
+}
+
+function normalizeOptionalText(value: unknown, maxLength: number): string | null {
+  const text = String(value ?? "").trim();
+  return text ? text.slice(0, maxLength) : null;
+}
+
+function normalizeGender(value: unknown): string | null | undefined {
+  const text = String(value ?? "").trim();
+  if (!text) return null;
+  return ["male", "female", "other", "unknown"].includes(text) ? text : undefined;
+}
+
+function normalizeBirthday(value: unknown): string | null | undefined {
+  const text = String(value ?? "").trim();
+  if (!text) return null;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) return undefined;
+  const date = new Date(`${text}T00:00:00Z`);
+  if (Number.isNaN(date.getTime()) || date.toISOString().slice(0, 10) !== text) return undefined;
+  return text;
+}
+
+function normalizeOptionalUrl(value: unknown): string | null | undefined {
+  const text = String(value ?? "").trim();
+  if (!text) return null;
+  try {
+    const url = new URL(text);
+    return url.protocol === "http:" || url.protocol === "https:" ? url.toString() : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 async function getCurrentUser(c: AppContext): Promise<User | null> {
@@ -2228,6 +2987,10 @@ async function createVerifiedUser(
     username: input.username,
     email: input.email,
     display_name: input.username,
+    nickname: null,
+    gender: null,
+    birthday: null,
+    avatar_url: null,
     email_verified: 1,
     is_admin: 0,
     is_active: 1
@@ -2244,41 +3007,73 @@ async function createVerifiedUser(
 async function issueOidcTokens(input: {
   env: Bindings;
   user: User;
-  clientId: string;
+  client: Client;
   scope: string;
   nonce?: string;
 }): Promise<{ accessToken: string; idToken: string }> {
   const issuer = normalizedIssuer(input.env.ISSUER);
   const privateJwk = parsePrivateJwk(input.env.OIDC_PRIVATE_JWK);
   const privateKey = await importJWK(privateJwk, "ES256");
+  const clientProfile = await getUserClientProfile(input.env.DB, input.user.id, input.client.id);
+  const claims = oidcClaims(input.user, clientProfile, input.client);
   const accessToken = await new SignJWT({
     scope: input.scope,
-    email: input.user.email,
-    name: input.user.display_name
+    ...claims
   })
     .setProtectedHeader({ alg: "ES256", kid: privateJwk.kid })
     .setIssuer(issuer)
     .setSubject(input.user.id)
-    .setAudience(input.clientId)
+    .setAudience(input.client.id)
     .setIssuedAt()
     .setExpirationTime(`${tokenMaxAgeSeconds}s`)
     .sign(privateKey);
 
   const idToken = await new SignJWT({
     nonce: input.nonce,
-    email: input.user.email,
-    email_verified: true,
-    name: input.user.display_name
+    ...claims
   })
     .setProtectedHeader({ alg: "ES256", kid: privateJwk.kid })
     .setIssuer(issuer)
     .setSubject(input.user.id)
-    .setAudience(input.clientId)
+    .setAudience(input.client.id)
     .setIssuedAt()
     .setExpirationTime(`${tokenMaxAgeSeconds}s`)
     .sign(privateKey);
 
   return { accessToken, idToken };
+}
+
+function oidcClaims(user: User, profile?: UserClientProfile | null, client?: Client | null): {
+  email: string;
+  email_verified: boolean;
+  name: string;
+  preferred_username?: string;
+  nickname: string;
+  gender?: string;
+  birthdate?: string;
+  picture?: string;
+  roles?: string[];
+} {
+  const email = profile?.email || user.email;
+  const emailVerified = profile?.email
+    ? profile.email.toLowerCase() === user.email.toLowerCase()
+      ? Boolean(user.email_verified)
+      : Boolean(profile.email_verified_at)
+    : Boolean(user.email_verified);
+  const fallbackName = profile?.nickname || profile?.username || user.nickname || user.display_name || user.username || email;
+  const claims = {
+    email,
+    email_verified: emailVerified,
+    name: fallbackName,
+    preferred_username: profile?.username || user.username || undefined,
+    nickname: fallbackName,
+    gender: user.gender ?? undefined,
+    birthdate: user.birthday ?? undefined,
+    picture: profile?.avatar_url || user.avatar_url || undefined
+  };
+  return client?.return_roles === 1
+    ? { ...claims, roles: user.is_admin ? ["admin"] : ["user"] }
+    : claims;
 }
 
 async function createRefreshToken(db: D1Database, userId: string, clientId: string, scope: string): Promise<string> {
@@ -2528,6 +3323,29 @@ function normalizeUsername(username?: string): string | null {
   return normalized;
 }
 
+function normalizeProfileUsername(username?: string): string | null | undefined {
+  const normalized = username?.trim();
+  if (!normalized) return null;
+  return /^[a-zA-Z0-9][a-zA-Z0-9_.@-]{1,63}$/.test(normalized) ? normalized : undefined;
+}
+
+function resolveClientProfileEmailVerifiedAt(input: {
+  nextEmail: string | null;
+  previousEmail: string | null;
+  previousVerifiedAt: string | null;
+  mainEmail: string;
+  mainEmailVerified: boolean;
+}): string | null {
+  if (!input.nextEmail) return null;
+  if (input.nextEmail.toLowerCase() === input.mainEmail.toLowerCase()) {
+    return input.mainEmailVerified ? new Date().toISOString() : null;
+  }
+  if (input.previousEmail?.toLowerCase() === input.nextEmail.toLowerCase()) {
+    return input.previousVerifiedAt;
+  }
+  return null;
+}
+
 function validatePassword(password?: string): string | null {
   if (!password || password.length < 6) {
     return "密码至少需要 6 位。";
@@ -2608,7 +3426,7 @@ function validateSmtpConfig(input: SmtpConfigInput, existingConfig?: SmtpConfig)
   const secureMode = input.secureMode;
   const username = input.username?.trim();
   const password = input.password?.trim() || existingConfig?.password || "";
-  const fromEmail = normalizeEmail(input.fromEmail);
+  const fromEmail = normalizeEmail(input.fromEmail) ?? "noreply@aiku.qzz.io";
   const fromName = input.fromName?.trim() || "统一登陆平台";
   if (!host || !Number.isInteger(port) || port <= 0 || port > 65535) {
     return { error: "SMTP 主机或端口无效。" };
@@ -2629,13 +3447,59 @@ function validateEmailDeliverySettings(
   input: SmtpConfigInput,
   provider: "resend" | "smtp"
 ): EmailDeliverySettings | { error: string } {
-  const resendFromEmail = normalizeEmail(input.fromEmail) ?? "noreply@example.com";
+  const resendFromEmail = normalizeEmail(input.fromEmail) ?? "noreply@aiku.qzz.io";
   const resendFromName = input.fromName?.trim() || "统一登陆平台";
   return {
     provider,
     resendFromEmail,
     resendFromName
   };
+}
+
+function validateSystemSettings(input: Partial<SystemSettings>): SystemSettings | { error: string } {
+  const siteName = String(input.siteName ?? "").trim() || "统一登陆平台";
+  if (siteName.length > 40) {
+    return { error: "系统名不能超过 40 个字符。" };
+  }
+  const logoUrl = String(input.logoUrl ?? "").trim() || "/brand.svg";
+  if (logoUrl.startsWith("/") && !logoUrl.startsWith("//")) {
+    return { siteName, logoUrl, registrationEnabled: input.registrationEnabled !== false };
+  }
+  try {
+    const url = new URL(logoUrl);
+    if (url.protocol !== "http:" && url.protocol !== "https:") {
+      return { error: "系统图标必须是相对路径、http 或 https 地址。" };
+    }
+    return { siteName, logoUrl: url.toString(), registrationEnabled: input.registrationEnabled !== false };
+  } catch {
+    return { error: "系统图标必须是有效地址。" };
+  }
+}
+
+async function saveSystemSettings(db: D1Database, settings: SystemSettings): Promise<void> {
+  await db.prepare("INSERT OR REPLACE INTO app_settings (key, value, updated_at) VALUES ('system', ?, ?)")
+    .bind(JSON.stringify(settings), new Date().toISOString())
+    .run();
+}
+
+async function getSystemSettings(db: D1Database): Promise<SystemSettings> {
+  const row = await db.prepare("SELECT value FROM app_settings WHERE key = 'system'").first<{ value: string }>();
+  if (!row) {
+    return {
+      siteName: "统一登陆平台",
+      logoUrl: "/brand.svg",
+      registrationEnabled: true
+    };
+  }
+  const value = safeJsonParse(row.value) as Partial<SystemSettings>;
+  const normalized = validateSystemSettings({
+    siteName: value.siteName,
+    logoUrl: value.logoUrl,
+    registrationEnabled: value.registrationEnabled
+  });
+  return "error" in normalized
+    ? { siteName: "统一登陆平台", logoUrl: "/brand.svg", registrationEnabled: true }
+    : normalized;
 }
 
 async function saveEmailDeliverySettings(db: D1Database, settings: EmailDeliverySettings): Promise<void> {
@@ -2649,14 +3513,14 @@ async function getEmailDeliverySettings(db: D1Database): Promise<EmailDeliverySe
   if (!row) {
     return {
       provider: "resend",
-      resendFromEmail: "noreply@example.com",
+      resendFromEmail: "noreply@aiku.qzz.io",
       resendFromName: "统一登陆平台"
     };
   }
   const value = safeJsonParse(row.value) as Partial<EmailDeliverySettings>;
   return {
     provider: value.provider === "smtp" ? "smtp" : "resend",
-    resendFromEmail: normalizeEmail(value.resendFromEmail) ?? "noreply@example.com",
+    resendFromEmail: normalizeEmail(value.resendFromEmail) ?? "noreply@aiku.qzz.io",
     resendFromName: value.resendFromName?.trim() || "统一登陆平台"
   };
 }
@@ -3314,11 +4178,122 @@ function safeReturnTo(returnTo: string | undefined, issuer: string): string {
   return fallback;
 }
 
+async function getLoginContext(
+  db: D1Database,
+  issuer: string,
+  returnTo: string,
+  clientId: string
+): Promise<{
+  client: { id: string; name: string; logoUrl: string | null; redirectUri: string | null } | null;
+  returnTo: string | null;
+}> {
+  const authorizeUrl = parseReturnToAuthorizeUrl(returnTo, issuer);
+  if (authorizeUrl) {
+    const client = await getClient(db, authorizeUrl.searchParams.get("client_id") ?? "");
+    if (!client || !client.is_active) {
+      return { client: null, returnTo: null };
+    }
+    const redirectUri = authorizeUrl.searchParams.get("redirect_uri") ?? "";
+    if (!parseJsonArray(client.redirect_uris).includes(redirectUri)) {
+      return { client: null, returnTo: null };
+    }
+    return {
+      client: {
+        id: client.id,
+        name: client.name,
+        logoUrl: client.logo_url,
+        redirectUri
+      },
+      returnTo: `${authorizeUrl.pathname}${authorizeUrl.search}`
+    };
+  }
+
+  const client = clientId ? await getClient(db, clientId) : null;
+  if (!client || !client.is_active) {
+    return { client: null, returnTo: null };
+  }
+  const redirectUri = parseJsonArray(client.redirect_uris)[0] ?? "";
+  if (!redirectUri) {
+    return { client: null, returnTo: null };
+  }
+  const nextAuthorizeUrl = new URL("/oauth/authorize", normalizedIssuer(issuer));
+  nextAuthorizeUrl.searchParams.set("client_id", client.id);
+  nextAuthorizeUrl.searchParams.set("redirect_uri", redirectUri);
+  nextAuthorizeUrl.searchParams.set("response_type", "code");
+  nextAuthorizeUrl.searchParams.set("scope", parseJsonArray(client.allowed_scopes).join(" "));
+  nextAuthorizeUrl.searchParams.set("state", createToken(16));
+  nextAuthorizeUrl.searchParams.set("nonce", createToken(16));
+  return {
+    client: {
+      id: client.id,
+      name: client.name,
+      logoUrl: client.logo_url,
+      redirectUri
+    },
+    returnTo: `${nextAuthorizeUrl.pathname}${nextAuthorizeUrl.search}`
+  };
+}
+
+function parseReturnToAuthorizeUrl(returnTo: string | undefined, issuer: string): URL | null {
+  if (!returnTo) {
+    return null;
+  }
+  const origin = normalizedIssuer(issuer);
+  try {
+    const url = returnTo.startsWith("/") ? new URL(returnTo, origin) : new URL(returnTo);
+    if (url.origin !== origin || url.pathname !== "/oauth/authorize") {
+      return null;
+    }
+    return url;
+  } catch {
+    return null;
+  }
+}
+
+async function defaultPostLogoutRedirect(db: D1Database, issuer: string, session: Session | null): Promise<string> {
+  const fallback = normalizedIssuer(issuer);
+  if (!session?.client_id) {
+    return fallback;
+  }
+  const grant = await db
+    .prepare(
+      `SELECT last_redirect_uri
+       FROM oauth_grants
+       WHERE user_id = ? AND client_id = ? AND revoked_at IS NULL
+       ORDER BY updated_at DESC
+       LIMIT 1`
+    )
+    .bind(session.user_id, session.client_id)
+    .first<{ last_redirect_uri: string }>();
+  if (grant?.last_redirect_uri) {
+    return grant.last_redirect_uri;
+  }
+  const client = await getClient(db, session.client_id);
+  const redirectUris = client ? parseJsonArray(client.redirect_uris) : [];
+  return redirectUris[0] || fallback;
+}
+
+function getClientIdFromIdTokenHint(idTokenHint: string | null): string | null {
+  if (!idTokenHint) {
+    return null;
+  }
+  try {
+    const parts = idTokenHint.split(".");
+    if (parts.length < 2) {
+      return null;
+    }
+    const payload = JSON.parse(new TextDecoder().decode(base64UrlDecode(parts[1]))) as { aud?: unknown };
+    return typeof payload.aud === "string" ? payload.aud : null;
+  } catch {
+    return null;
+  }
+}
+
 async function safePostLogoutRedirect(
   db: D1Database,
-  input: { clientId?: string; postLogoutRedirectUri?: string; issuer: string }
+  input: { clientId?: string; postLogoutRedirectUri?: string; issuer: string; state?: string; fallback?: string }
 ): Promise<string> {
-  const fallback = normalizedIssuer(input.issuer);
+  const fallback = input.fallback || normalizedIssuer(input.issuer);
   if (!input.clientId || !input.postLogoutRedirectUri) {
     return fallback;
   }
@@ -3329,8 +4304,18 @@ async function safePostLogoutRedirect(
 
   try {
     const redirect = new URL(input.postLogoutRedirectUri);
+    const issuer = normalizedIssuer(input.issuer);
+    if (redirect.origin === issuer && redirect.pathname === "/login" && redirect.searchParams.get("client_id") === client.id) {
+      if (input.state) {
+        redirect.searchParams.set("state", input.state);
+      }
+      return redirect.toString();
+    }
     const allowedOrigins = parseJsonArray(client.redirect_uris).map((uri) => new URL(uri).origin);
     if (allowedOrigins.includes(redirect.origin)) {
+      if (input.state) {
+        redirect.searchParams.set("state", input.state);
+      }
       return redirect.toString();
     }
   } catch {
@@ -3412,6 +4397,7 @@ function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
 async function cleanupExpiredData(env: Bindings): Promise<Record<string, number>> {
   const now = nowSeconds();
   const retentionIso = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+  const auditRetentionIso = new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
   const results = await env.DB.batch([
     env.DB.prepare("DELETE FROM authorization_codes WHERE expires_at < ?").bind(now),
     env.DB.prepare(
@@ -3421,13 +4407,15 @@ async function cleanupExpiredData(env: Bindings): Promise<Record<string, number>
     env.DB.prepare("DELETE FROM refresh_tokens WHERE expires_at < ? OR (revoked_at IS NOT NULL AND revoked_at < ?)").bind(
       now,
       retentionIso
-    )
+    ),
+    env.DB.prepare("DELETE FROM audit_events WHERE created_at < ?").bind(auditRetentionIso)
   ]);
   return {
     authorizationCodes: results[0].meta.changes ?? 0,
     emailVerificationCodes: results[1].meta.changes ?? 0,
     sessions: results[2].meta.changes ?? 0,
-    refreshTokens: results[3].meta.changes ?? 0
+    refreshTokens: results[3].meta.changes ?? 0,
+    auditEvents: results[4].meta.changes ?? 0
   };
 }
 

@@ -6,24 +6,43 @@
   "main": "src/index.ts",
   "scripts": {
     "dev:worker": "wrangler dev --ip 127.0.0.1 --port 8787",
+    "dev:frontend": "vite",
     "dev:pages": "wrangler pages dev pages --ip 127.0.0.1 --port 8788 --inspector-port 0",
-    "deploy:worker": "wrangler deploy",
-    "deploy:pages": "wrangler pages deploy pages --project-name cloudflare-sso-pages",
+    "build:frontend": "vite build",
+    "deploy:worker": "wrangler deploy --config wrangler.production.jsonc",
+    "deploy:pages": "wrangler pages deploy pages --project-name private-oidc-pages",
     "types": "wrangler types",
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && vue-tsc --noEmit -p tsconfig.frontend.json",
     "db:migrate:local": "wrangler d1 migrations apply cloudflare-sso --local",
-    "db:migrate:remote": "wrangler d1 migrations apply cloudflare-sso --remote"
+    "db:migrate:remote": "wrangler d1 migrations apply private-oidc --remote --config wrangler.production.jsonc"
   },
-  "keywords": ["cloudflare", "oidc", "sso", "workers", "pages", "d1"],
+  "keywords": [
+    "cloudflare",
+    "oidc",
+    "sso",
+    "workers",
+    "pages",
+    "d1"
+  ],
   "author": "",
   "license": "MIT",
   "dependencies": {
+    "@element-plus/icons-vue": "^2.3.2",
+    "@types/markdown-it": "^14.1.2",
+    "element-plus": "^2.14.1",
     "hono": "^4.12.24",
-    "jose": "^6.2.3"
+    "jose": "^6.2.3",
+    "lucide-vue-next": "^0.577.0",
+    "markdown-it": "^14.2.0",
+    "vue": "^3.5.35",
+    "vue-router": "^4.6.4"
   },
   "devDependencies": {
     "@types/node": "^25.9.2",
+    "@vitejs/plugin-vue": "^6.0.7",
     "typescript": "^6.0.3",
+    "vite": "^8.0.16",
+    "vue-tsc": "^3.3.4",
     "wrangler": "^4.98.0"
   }
 }

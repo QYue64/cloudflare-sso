@@ -189,6 +189,14 @@ Response Type: code
 PKCE: S256
 ```
 
+登出推荐跳转到：
+
+```text
+https://login.example.com/oauth/logout?client_id=YOUR_CLIENT_ID&post_logout_redirect_uri=https%3A%2F%2Fapp.example.com%2Fcallback&state=YOUR_STATE
+```
+
+`post_logout_redirect_uri` 需要和应用回调地址同源。也可以传 `id_token_hint`，平台会从 `id_token_hint` 中识别 `client_id`。如果没有传 `post_logout_redirect_uri`，平台会优先根据当前会话关联的应用和最近授权记录回到业务系统；无法识别时才回到统一登陆平台。
+
 也可以登录管理员后台，在“应用接入”里创建应用并复制配置。
 
 ## 常用命令

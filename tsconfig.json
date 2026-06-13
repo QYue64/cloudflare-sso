@@ -9,6 +9,7 @@
     "noEmit": true,
     "skipLibCheck": true,
     "allowSyntheticDefaultImports": true,
+    "jsx": "preserve",
     "forceConsistentCasingInFileNames": true
   },
   "include": ["src/**/*.ts", "worker-configuration.d.ts"]
