@@ -3,13 +3,18 @@ import { computed, onMounted, reactive, ref } from "vue";
 import { useRoute } from "vue-router";
 import { ShieldCheck } from "lucide-vue-next";
 import AppToast from "../components/AppToast.vue";
+import TurnstileWidget from "../components/TurnstileWidget.vue";
 import { postJson, requestJson } from "../api";
 import { appState, handleError, loadSystemSettings } from "../store";
+import type { PublicTurnstileSettings } from "../types";
 
 const route = useRoute();
 const busy = ref(false);
 const loginClient = ref<{ id: string; name: string; logoUrl?: string | null } | null>(null);
 const resolvedReturnTo = ref("");
+const turnstileSettings = ref<PublicTurnstileSettings | null>(null);
+const turnstileToken = ref("");
+const turnstileWidget = ref<InstanceType<typeof TurnstileWidget> | null>(null);
 const form = reactive({
   identifier: "",
   password: ""
@@ -19,9 +24,16 @@ const clientId = computed(() => String(route.query.client_id || ""));
 const loginDescription = computed(() =>
   loginClient.value ? `登录后将继续访问 ${loginClient.value.name}。` : "使用用户名或邮箱登录你的统一账号。"
 );
+const showTurnstile = computed(() =>
+  turnstileSettings.value?.enabled && turnstileSettings.value.enableOnLogin
+);
 
 onMounted(async () => {
   await loadSystemSettings().catch(handleError);
+
+  // 加载 Turnstile 配置
+  turnstileSettings.value = await requestJson<PublicTurnstileSettings>("/api/public/turnstile").catch(() => null);
+
   if (!returnTo.value && !clientId.value) return;
   const result = await requestJson<{ client: { id: string; name: string; logoUrl?: string | null } | null; returnTo?: string | null }>(
     `/api/auth/login-context?return_to=${encodeURIComponent(returnTo.value)}&client_id=${encodeURIComponent(clientId.value)}`
@@ -30,17 +42,35 @@ onMounted(async () => {
   resolvedReturnTo.value = result.returnTo || returnTo.value;
 });
 
+function handleTurnstileVerify(token: string) {
+  turnstileToken.value = token;
+}
+
 async function submit() {
   if (!form.identifier.trim()) throw new Error("请输入邮箱或用户名。");
   if (!form.password) throw new Error("请输入密码。");
+
+  // 检查 Turnstile
+  if (showTurnstile.value && !turnstileToken.value) {
+    throw new Error("请完成人机验证。");
+  }
+
   busy.value = true;
   try {
     const result = await postJson<{ redirectTo?: string }>("/api/login", {
       identifier: form.identifier.trim(),
       password: form.password,
-      returnTo: resolvedReturnTo.value || returnTo.value || undefined
+      returnTo: resolvedReturnTo.value || returnTo.value || undefined,
+      turnstileToken: turnstileToken.value || undefined
     });
     window.location.assign(result.redirectTo || "/dashboard");
+  } catch (error) {
+    // 重置 Turnstile
+    if (turnstileWidget.value) {
+      turnstileWidget.value.reset();
+      turnstileToken.value = "";
+    }
+    throw error;
   } finally {
     busy.value = false;
   }
@@ -77,6 +107,14 @@ async function submit() {
           密码
           <input v-model="form.password" type="password" autocomplete="current-password" placeholder="请输入密码" />
         </label>
+
+        <TurnstileWidget
+          v-if="showTurnstile"
+          ref="turnstileWidget"
+          :site-key="turnstileSettings?.siteKey || ''"
+          @verify="handleTurnstileVerify"
+        />
+
         <el-button type="primary" native-type="submit" :loading="busy" class="full-button">登录</el-button>
         <div class="auth-link-row">
           <RouterLink class="auth-sub-link" to="/forgot-password">忘记密码？</RouterLink>

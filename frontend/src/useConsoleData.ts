@@ -75,7 +75,7 @@ export async function loadSettings(force = false) {
   consoleData.smtpLoaded = true;
 }
 
-export async function loadAudit(force = false, page = 1, pageSize = 10) {
+export async function loadAudit(force = false, page = 1, pageSize = 8) {
   if (!appState.user?.isAdmin) return;
   if (consoleData.auditLoaded && !force) return;
   const result = await requestJson<{ events: AuditEvent[]; total?: number }>(`/api/admin/audit-events?page=${page}&pageSize=${pageSize}`);

@@ -1,26 +1,26 @@
 <script setup lang="ts">
-import { computed, reactive, ref } from "vue";
+import { computed, onMounted, reactive, ref } from "vue";
 import { BadgeCheck, CalendarDays, IdCard, KeyRound, LogOut, Mail, Pencil, ShieldCheck, UserRound, VenusAndMars } from "lucide-vue-next";
 import AppModal from "../components/AppModal.vue";
+import TurnstileWidget from "../components/TurnstileWidget.vue";
 import FormActions from "../components/FormActions.vue";
-import { apiBase, postJson } from "../api";
+import { apiBase, postJson, requestJson } from "../api";
 import { appState, handleError, loadMe, toast } from "../store";
 import { avatarText, displayName, genderLabel } from "../utils/format";
-import type { ClientProfile } from "../types";
+import type { PublicTurnstileSettings } from "../types";
 
 const modalOpen = ref(false);
 const emailOpen = ref(false);
 const profileOpen = ref(false);
-const clientProfileOpen = ref(false);
 const busy = ref(false);
 const emailBusy = ref(false);
 const profileBusy = ref(false);
 const codeBusy = ref(false);
 const cooldown = ref(0);
-const clientProfileCooldown = ref(0);
-const selectedClientProfile = ref<ClientProfile | null>(null);
+const turnstileSettings = ref<PublicTurnstileSettings | null>(null);
+const turnstileToken = ref("");
+const turnstileWidget = ref<InstanceType<typeof TurnstileWidget> | null>(null);
 let cooldownTimer = 0;
-let clientProfileCooldownTimer = 0;
 const form = reactive({
   currentPassword: "",
   newPassword: "",
@@ -37,12 +37,15 @@ const profileForm = reactive({
   birthday: "",
   avatarUrl: ""
 });
-const clientProfileForm = reactive({
-  username: "",
-  email: "",
-  nickname: "",
-  avatarUrl: ""
+const showTurnstile = computed(() => turnstileSettings.value?.enabled && turnstileSettings.value.enableOnEmailChange);
+
+onMounted(async () => {
+  turnstileSettings.value = await requestJson<PublicTurnstileSettings>("/api/public/turnstile").catch(() => null);
 });
+
+function handleTurnstileVerify(token: string) {
+  turnstileToken.value = token;
+}
 
 const profileTitle = computed(() => {
   const user = appState.user;
@@ -94,35 +97,6 @@ function startCooldown(seconds: number) {
   }, 1000);
 }
 
-function startClientProfileCooldown(seconds: number) {
-  window.clearInterval(clientProfileCooldownTimer);
-  clientProfileCooldown.value = Math.min(seconds || 60, 60);
-  clientProfileCooldownTimer = window.setInterval(() => {
-    clientProfileCooldown.value -= 1;
-    if (clientProfileCooldown.value <= 0) window.clearInterval(clientProfileCooldownTimer);
-  }, 1000);
-}
-
-function openClientProfileModal(profile: ClientProfile) {
-  selectedClientProfile.value = profile;
-  const user = appState.user;
-  Object.assign(clientProfileForm, {
-    username: profile.username || user?.username || "",
-    email: profile.email || user?.email || "",
-    nickname: profile.nickname || user?.nickname || user?.displayName || user?.username || "",
-    avatarUrl: profile.avatarUrl || user?.avatarUrl || ""
-  });
-  clientProfileOpen.value = true;
-}
-
-function validateClientProfileEmail(required = false) {
-  const email = clientProfileForm.email.trim();
-  if (!email && !required) return;
-  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-    throw new Error("请输入有效邮箱地址。");
-  }
-}
-
 async function submitPassword() {
   if (form.newPassword.length < 6) throw new Error("新密码至少需要 6 位。");
   if (form.newPassword !== form.confirmPassword) throw new Error("两次输入的新密码不一致。");
@@ -141,13 +115,27 @@ async function submitPassword() {
 
 async function sendEmailCode() {
   validateEmail();
+
+  // 检查 Turnstile
+  if (showTurnstile.value && !turnstileToken.value) {
+    throw new Error("请完成人机验证。");
+  }
+
   codeBusy.value = true;
   try {
     const result = await postJson<{ expiresIn?: number }>("/api/account/email/start", {
-      email: emailForm.email.trim()
+      email: emailForm.email.trim(),
+      turnstileToken: turnstileToken.value || undefined
     });
     toast("验证码已发送，请查看新邮箱。");
     startCooldown(result.expiresIn || 60);
+  } catch (error) {
+    // 重置 Turnstile
+    if (turnstileWidget.value) {
+      turnstileWidget.value.reset();
+      turnstileToken.value = "";
+    }
+    throw error;
   } finally {
     codeBusy.value = false;
   }
@@ -325,6 +313,14 @@ async function submitProfile() {
             {{ cooldown > 0 ? `${cooldown} 秒` : codeBusy ? "发送中" : "发送验证码" }}
           </el-button>
         </div>
+
+        <TurnstileWidget
+          v-if="showTurnstile"
+          ref="turnstileWidget"
+          :site-key="turnstileSettings?.siteKey || ''"
+          @verify="handleTurnstileVerify"
+        />
+
         <FormActions :busy="emailBusy" submit-text="确认更换" @cancel="emailOpen = false" />
       </form>
     </AppModal>

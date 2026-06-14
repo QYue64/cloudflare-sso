@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref, watch } from "vue";
 import AppModal from "../components/AppModal.vue";
+import AppPagination from "../components/AppPagination.vue";
 import EmptyState from "../components/EmptyState.vue";
 import FormActions from "../components/FormActions.vue";
 import { KeyRound, LogOut, Pencil, ShieldCheck, Trash2, UserRound } from "lucide-vue-next";
@@ -30,11 +31,8 @@ const form = reactive({
   active: true
 });
 const passwordForm = reactive({ user: null as AdminUser | null, password: "", confirmPassword: "" });
-const pagination = reactive({ page: 1, pageSize: 10 });
-const pagedUsers = computed(() => {
-  const start = (pagination.page - 1) * pagination.pageSize;
-  return filteredUsers.value.slice(start, start + pagination.pageSize);
-});
+const currentPage = ref(1);
+const pageSize = ref(8);
 
 const filteredUsers = computed(() => {
   const query = keyword.value.trim().toLowerCase();
@@ -47,6 +45,11 @@ const filteredUsers = computed(() => {
   });
 });
 
+const pagedUsers = computed(() => {
+  const start = (currentPage.value - 1) * pageSize.value;
+  return filteredUsers.value.slice(start, start + pageSize.value);
+});
+
 const userStats = computed(() => ({
   total: consoleData.users.length,
   admin: consoleData.users.filter((user) => user.admin).length,
@@ -57,8 +60,12 @@ const userStats = computed(() => ({
 onMounted(() => loadUsers().catch(handleError));
 
 watch([keyword, roleFilter, statusFilter], () => {
-  pagination.page = 1;
+  currentPage.value = 1;
 });
+
+function handlePageChange(page: number) {
+  currentPage.value = page;
+}
 
 function openCreate() {
   editingId.value = "";
@@ -246,15 +253,13 @@ function profileCompleteness(user: AdminUser): number {
         </template>
       </el-table-column>
     </el-table>
-    <div v-if="filteredUsers.length > pagination.pageSize" class="table-pagination">
-      <el-pagination
-        v-model:current-page="pagination.page"
-        v-model:page-size="pagination.pageSize"
-        :page-sizes="[10, 20, 50]"
-        :total="filteredUsers.length"
-        layout="total, sizes, prev, pager, next"
-      />
-    </div>
+
+    <AppPagination
+      :current-page="currentPage"
+      :page-size="pageSize"
+      :total="filteredUsers.length"
+      @update:current-page="handlePageChange"
+    />
 
     <AppModal v-model="modalOpen" :title="editingId ? '编辑用户' : '新增用户'" wide>
       <form class="modal-form two-col" @submit.prevent="submitUser().catch(handleError)">

@@ -1,13 +1,18 @@
 <script setup lang="ts">
-import { reactive, ref } from "vue";
+import { computed, onMounted, reactive, ref } from "vue";
 import { KeyRound } from "lucide-vue-next";
 import AppToast from "../components/AppToast.vue";
-import { postJson } from "../api";
+import TurnstileWidget from "../components/TurnstileWidget.vue";
+import { postJson, requestJson } from "../api";
 import { handleError, toast } from "../store";
+import type { PublicTurnstileSettings } from "../types";
 
 const busy = ref(false);
 const codeBusy = ref(false);
 const cooldown = ref(0);
+const turnstileSettings = ref<PublicTurnstileSettings | null>(null);
+const turnstileToken = ref("");
+const turnstileWidget = ref<InstanceType<typeof TurnstileWidget> | null>(null);
 let timer = 0;
 const form = reactive({
   email: "",
@@ -15,6 +20,15 @@ const form = reactive({
   password: "",
   confirmPassword: ""
 });
+const showTurnstile = computed(() => turnstileSettings.value?.enabled && turnstileSettings.value.enableOnPasswordReset);
+
+onMounted(async () => {
+  turnstileSettings.value = await requestJson<PublicTurnstileSettings>("/api/public/turnstile").catch(() => null);
+});
+
+function handleTurnstileVerify(token: string) {
+  turnstileToken.value = token;
+}
 
 function validateEmail() {
   if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(form.email.trim())) {
@@ -40,13 +54,27 @@ function startCooldown(seconds: number) {
 
 async function sendCode() {
   validateEmail();
+
+  // 检查 Turnstile
+  if (showTurnstile.value && !turnstileToken.value) {
+    throw new Error("请完成人机验证。");
+  }
+
   codeBusy.value = true;
   try {
     const result = await postJson<{ expiresIn?: number }>("/api/auth/password/reset/start", {
-      email: form.email.trim()
+      email: form.email.trim(),
+      turnstileToken: turnstileToken.value || undefined
     });
     toast("如果邮箱存在，验证码会发送到该邮箱。");
     startCooldown(result.expiresIn || 60);
+  } catch (error) {
+    // 重置 Turnstile
+    if (turnstileWidget.value) {
+      turnstileWidget.value.reset();
+      turnstileToken.value = "";
+    }
+    throw error;
   } finally {
     codeBusy.value = false;
   }
@@ -101,6 +129,14 @@ async function submit() {
             {{ cooldown > 0 ? `${cooldown} 秒` : codeBusy ? "发送中" : "发送验证码" }}
           </el-button>
         </div>
+
+        <TurnstileWidget
+          v-if="showTurnstile"
+          ref="turnstileWidget"
+          :site-key="turnstileSettings?.siteKey || ''"
+          @verify="handleTurnstileVerify"
+        />
+
         <label>
           新密码
           <input v-model="form.password" type="password" autocomplete="new-password" placeholder="请输入至少 6 位新密码" />

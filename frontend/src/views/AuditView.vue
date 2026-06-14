@@ -1,25 +1,21 @@
 <script setup lang="ts">
-import { onMounted, reactive } from "vue";
+import { onMounted, ref } from "vue";
+import AppPagination from "../components/AppPagination.vue";
 import EmptyState from "../components/EmptyState.vue";
 import { consoleData, loadAudit } from "../useConsoleData";
 import { formatDate } from "../utils/format";
 import { handleError } from "../store";
 import type { AuditEvent } from "../types";
 
-const pagination = reactive({ page: 1, pageSize: 10 });
+const currentPage = ref(1);
+const pageSize = ref(8);
 
 async function refreshAudit() {
-  await loadAudit(true, pagination.page, pagination.pageSize);
+  await loadAudit(true, currentPage.value, pageSize.value);
 }
 
-function changePage(page: number) {
-  pagination.page = page;
-  refreshAudit().catch(handleError);
-}
-
-function changePageSize(pageSize: number) {
-  pagination.page = 1;
-  pagination.pageSize = pageSize;
+function handlePageChange(page: number) {
+  currentPage.value = page;
   refreshAudit().catch(handleError);
 }
 
@@ -103,17 +99,13 @@ function targetLabel(event: AuditEvent): string {
           <template #default="{ row }">{{ formatDate(row.createdAt) }}</template>
         </el-table-column>
       </el-table>
-      <div class="table-pagination">
-        <el-pagination
-          :current-page="pagination.page"
-          :page-size="pagination.pageSize"
-          :page-sizes="[10, 20, 50]"
-          :total="consoleData.auditTotal"
-          layout="total, sizes, prev, pager, next"
-          @update:current-page="changePage"
-          @update:page-size="changePageSize"
-        />
-      </div>
+
+      <AppPagination
+        :current-page="currentPage"
+        :page-size="pageSize"
+        :total="consoleData.auditTotal"
+        @update:current-page="handlePageChange"
+      />
     </template>
   </section>
 </template>

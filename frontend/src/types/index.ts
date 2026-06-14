@@ -106,6 +106,18 @@ export interface SystemConfig {
   registrationEnabled: boolean;
 }
 
+export interface TurnstileSettings {
+  enabled: boolean;
+  siteKey: string;
+  secretKey: string;
+  enableOnLogin: boolean;
+  enableOnRegister: boolean;
+  enableOnPasswordReset: boolean;
+  enableOnEmailChange: boolean;
+}
+
+export type PublicTurnstileSettings = Omit<TurnstileSettings, "secretKey">;
+
 export interface SettingsConfig {
   system: SystemConfig;
   email: SmtpConfig;

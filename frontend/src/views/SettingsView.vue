@@ -1,15 +1,19 @@
 <script setup lang="ts">
 import { onMounted, reactive, ref, watch } from "vue";
 import AppModal from "../components/AppModal.vue";
-import { postJson } from "../api";
+import { postJson, requestJson } from "../api";
 import { handleError, toast } from "../store";
 import { consoleData, loadSettings } from "../useConsoleData";
+import type { TurnstileSettings } from "../types";
 
 const systemOpen = ref(false);
 const emailOpen = ref(false);
+const turnstileOpen = ref(false);
 const systemBusy = ref(false);
 const emailBusy = ref(false);
 const testBusy = ref(false);
+const turnstileBusy = ref(false);
+const turnstileSettings = ref<TurnstileSettings | null>(null);
 const systemForm = reactive({
   siteName: "统一登陆平台",
   logoUrl: "/brand.svg",
@@ -26,6 +30,15 @@ const emailForm = reactive({
   password: "",
   testEmail: ""
 });
+const turnstileForm = reactive<TurnstileSettings>({
+  enabled: false,
+  siteKey: "",
+  secretKey: "",
+  enableOnLogin: true,
+  enableOnRegister: true,
+  enableOnPasswordReset: true,
+  enableOnEmailChange: true
+});
 
 function useDefaultSystemSettings() {
   Object.assign(systemForm, {
@@ -35,7 +48,14 @@ function useDefaultSystemSettings() {
   });
 }
 
-onMounted(() => loadSettings().catch(handleError));
+onMounted(() => {
+  loadSettings().catch(handleError);
+  loadTurnstile().catch(handleError);
+});
+
+async function loadTurnstile() {
+  turnstileSettings.value = await requestJson<TurnstileSettings>("/api/admin/turnstile");
+}
 
 watch(systemOpen, (open) => {
   if (!open) return;
@@ -60,6 +80,11 @@ watch(emailOpen, (open) => {
     password: "",
     testEmail: ""
   });
+});
+
+watch(turnstileOpen, (open) => {
+  if (!open || !turnstileSettings.value) return;
+  Object.assign(turnstileForm, turnstileSettings.value);
 });
 
 async function submitSystem() {
@@ -107,6 +132,23 @@ async function testEmail() {
     toast("测试邮件已发送");
   } finally {
     testBusy.value = false;
+  }
+}
+
+async function submitTurnstile() {
+  if (turnstileForm.enabled && (!turnstileForm.siteKey.trim() || !turnstileForm.secretKey.trim())) {
+    toast("启用 Turnstile 时，站点密钥和密钥不能为空。", "error");
+    return;
+  }
+
+  turnstileBusy.value = true;
+  try {
+    await postJson("/api/admin/turnstile", turnstileForm);
+    await loadTurnstile();
+    turnstileOpen.value = false;
+    toast("Turnstile 配置已保存");
+  } finally {
+    turnstileBusy.value = false;
   }
 }
 </script>
@@ -161,6 +203,22 @@ async function testEmail() {
       </div>
     </section>
 
+    <section class="settings-section">
+      <div class="section-heading">
+        <div>
+          <span class="account-kicker">安全配置</span>
+          <strong>Turnstile 人机验证</strong>
+        </div>
+        <el-button type="primary" plain @click="turnstileOpen = true">编辑验证配置</el-button>
+      </div>
+      <div class="settings-grid">
+        <div><span>验证状态</span><strong>{{ turnstileSettings?.enabled ? "已启用" : "未启用" }}</strong></div>
+        <div v-if="turnstileSettings?.enabled"><span>Site Key</span><strong>{{ turnstileSettings?.siteKey || "-" }}</strong></div>
+        <div v-if="turnstileSettings?.enabled"><span>登录页面</span><strong>{{ turnstileSettings?.enableOnLogin ? "已启用" : "未启用" }}</strong></div>
+        <div v-if="turnstileSettings?.enabled"><span>注册页面</span><strong>{{ turnstileSettings?.enableOnRegister ? "已启用" : "未启用" }}</strong></div>
+      </div>
+    </section>
+
     <AppModal v-model="systemOpen" title="系统配置" wide>
       <form class="modal-form two-col" @submit.prevent="submitSystem().catch(handleError)">
         <label>系统名<input v-model="systemForm.siteName" maxlength="40" placeholder="统一登陆平台" /></label>
@@ -206,6 +264,69 @@ async function testEmail() {
         <div class="form-actions span-two">
           <el-button :loading="testBusy" @click="testEmail().catch(handleError)">发送测试</el-button>
           <el-button type="primary" native-type="submit" :loading="emailBusy">保存</el-button>
+        </div>
+      </form>
+    </AppModal>
+
+    <AppModal v-model="turnstileOpen" title="Turnstile 人机验证" wide>
+      <form class="modal-form two-col" @submit.prevent="submitTurnstile().catch(handleError)">
+        <label class="settings-switch-item span-two">
+          <span>
+            <strong>启用 Turnstile</strong>
+            <small>开启后，可在登录和注册页面启用人机验证。Cloudflare Turnstile 完全免费，无请求次数限制。</small>
+          </span>
+          <el-switch v-model="turnstileForm.enabled" />
+        </label>
+
+        <template v-if="turnstileForm.enabled">
+          <label class="span-two">
+            站点密钥（Site Key）
+            <input v-model="turnstileForm.siteKey" type="text" placeholder="1x00000000000000000000AA" />
+            <small>用于前端展示，可公开。从 <a href="https://dash.cloudflare.com" target="_blank">Cloudflare Dashboard</a> 获取。</small>
+          </label>
+
+          <label class="span-two">
+            密钥（Secret Key）
+            <input v-model="turnstileForm.secretKey" type="password" placeholder="1x0000000000000000000000000000000AA" />
+            <small>用于后端验证，加密存储，不会泄露。</small>
+          </label>
+
+          <label class="settings-switch-item span-two">
+            <span>
+              <strong>登录页面启用</strong>
+              <small>在用户登录时进行人机验证，防止暴力破解。</small>
+            </span>
+            <el-switch v-model="turnstileForm.enableOnLogin" />
+          </label>
+
+          <label class="settings-switch-item span-two">
+            <span>
+              <strong>注册页面启用</strong>
+              <small>在用户注册时进行人机验证，防止批量注册。</small>
+            </span>
+            <el-switch v-model="turnstileForm.enableOnRegister" />
+          </label>
+
+          <label class="settings-switch-item span-two">
+            <span>
+              <strong>忘记密码启用</strong>
+              <small>在用户申请重置密码时进行人机验证，防止邮件滥用。</small>
+            </span>
+            <el-switch v-model="turnstileForm.enableOnPasswordReset" />
+          </label>
+
+          <label class="settings-switch-item span-two">
+            <span>
+              <strong>更换邮箱启用</strong>
+              <small>在用户更换邮箱时进行人机验证，防止邮件滥用。</small>
+            </span>
+            <el-switch v-model="turnstileForm.enableOnEmailChange" />
+          </label>
+        </template>
+
+        <div class="form-actions span-two">
+          <el-button @click="turnstileOpen = false">取消</el-button>
+          <el-button type="primary" native-type="submit" :loading="turnstileBusy">保存</el-button>
         </div>
       </form>
     </AppModal>

@@ -3,8 +3,10 @@ import { computed, onMounted, reactive, ref } from "vue";
 import { useRoute } from "vue-router";
 import { UserPlus } from "lucide-vue-next";
 import AppToast from "../components/AppToast.vue";
+import TurnstileWidget from "../components/TurnstileWidget.vue";
 import { postJson, requestJson } from "../api";
 import { appState, handleError, loadSystemSettings, toast } from "../store";
+import type { PublicTurnstileSettings } from "../types";
 
 const route = useRoute();
 const busy = ref(false);
@@ -12,6 +14,9 @@ const codeBusy = ref(false);
 const cooldown = ref(0);
 const loginClient = ref<{ id: string; name: string; logoUrl?: string | null } | null>(null);
 const resolvedReturnTo = ref("");
+const turnstileSettings = ref<PublicTurnstileSettings | null>(null);
+const turnstileToken = ref("");
+const turnstileWidget = ref<InstanceType<typeof TurnstileWidget> | null>(null);
 let timer = 0;
 const form = reactive({
   username: "",
@@ -25,9 +30,16 @@ const clientId = computed(() => String(route.query.client_id || ""));
 const registerDescription = computed(() =>
   loginClient.value ? `注册后将继续访问 ${loginClient.value.name}。` : "填写邮箱后发送验证码完成注册。"
 );
+const showTurnstile = computed(() =>
+  turnstileSettings.value?.enabled && turnstileSettings.value.enableOnRegister
+);
 
 onMounted(async () => {
   await loadSystemSettings().catch(handleError);
+
+  // 加载 Turnstile 配置
+  turnstileSettings.value = await requestJson<PublicTurnstileSettings>("/api/public/turnstile").catch(() => null);
+
   if (!returnTo.value && !clientId.value) return;
   const result = await requestJson<{ client: { id: string; name: string; logoUrl?: string | null } | null; returnTo?: string | null }>(
     `/api/auth/login-context?return_to=${encodeURIComponent(returnTo.value)}&client_id=${encodeURIComponent(clientId.value)}`
@@ -35,6 +47,10 @@ onMounted(async () => {
   loginClient.value = result.client;
   resolvedReturnTo.value = result.returnTo || returnTo.value;
 });
+
+function handleTurnstileVerify(token: string) {
+  turnstileToken.value = token;
+}
 
 function validate(requireCode: boolean) {
   if (!/^[A-Za-z0-9][A-Za-z0-9_-]{2,31}$/.test(form.username.trim())) {
@@ -57,14 +73,28 @@ function startCooldown(seconds: number) {
 
 async function sendCode() {
   validate(false);
+
+  // 检查 Turnstile
+  if (showTurnstile.value && !turnstileToken.value) {
+    throw new Error("请完成人机验证。");
+  }
+
   codeBusy.value = true;
   try {
     const result = await postJson<{ expiresIn?: number }>("/api/auth/email/start", {
       username: form.username.trim(),
-      email: form.email.trim()
+      email: form.email.trim(),
+      turnstileToken: turnstileToken.value || undefined
     });
     toast("验证码已发送，请查看收件箱或垃圾邮件。");
     startCooldown(result.expiresIn || 60);
+  } catch (error) {
+    // 重置 Turnstile
+    if (turnstileWidget.value) {
+      turnstileWidget.value.reset();
+      turnstileToken.value = "";
+    }
+    throw error;
   } finally {
     codeBusy.value = false;
   }
@@ -126,6 +156,7 @@ async function submit() {
           确认密码
           <input v-model="form.confirmPassword" type="password" autocomplete="new-password" placeholder="请再次输入密码" />
         </label>
+
         <div class="code-row">
           <label>
             验证码
@@ -135,6 +166,14 @@ async function submit() {
             {{ cooldown > 0 ? `${cooldown} 秒` : codeBusy ? "发送中" : "发送验证码" }}
           </el-button>
         </div>
+
+        <TurnstileWidget
+          v-if="showTurnstile"
+          ref="turnstileWidget"
+          :site-key="turnstileSettings?.siteKey || ''"
+          @verify="handleTurnstileVerify"
+        />
+
         <el-button type="primary" native-type="submit" :loading="busy" class="full-button">注册并登录</el-button>
         <RouterLink
           class="auth-switch"

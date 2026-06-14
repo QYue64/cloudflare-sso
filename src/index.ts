@@ -174,6 +174,16 @@ type SystemSettings = {
   registrationEnabled: boolean;
 };
 
+type TurnstileSettings = {
+  enabled: boolean;
+  siteKey: string;
+  secretKey: string;
+  enableOnLogin: boolean;
+  enableOnRegister: boolean;
+  enableOnPasswordReset: boolean;
+  enableOnEmailChange: boolean;
+};
+
 const app = new Hono<{ Bindings: Bindings }>();
 const sessionCookie = "sso_session";
 const sessionMaxAgeSeconds = 60 * 60 * 12;
@@ -718,17 +728,31 @@ async function handleRefreshTokenGrant(
 
 app.post("/api/login", async (c) => {
   try {
-    const { identifier, email, username, password, returnTo } = await c.req.json<{
+    const { identifier, email, username, password, returnTo, turnstileToken } = await c.req.json<{
       identifier?: string;
       email?: string;
       username?: string;
       password?: string;
       returnTo?: string;
+      turnstileToken?: string;
     }>();
     const loginId = String(identifier ?? email ?? username ?? "").trim();
 
     if (!loginId || !password) {
       return withCors(c, c.json({ error: "请输入邮箱或用户名，以及密码。" }, 400));
+    }
+
+    // 检查 Turnstile 验证
+    const turnstileSettings = await getTurnstileSettings(c.env.DB, c.env.OIDC_PRIVATE_JWK);
+    if (turnstileSettings.enabled && turnstileSettings.enableOnLogin) {
+      if (!turnstileToken) {
+        return withCors(c, c.json({ error: "请完成人机验证。" }, 400));
+      }
+      const remoteIp = c.req.header("CF-Connecting-IP") || c.req.header("X-Forwarded-For");
+      const verified = await verifyTurnstileToken(turnstileSettings.secretKey, turnstileToken, remoteIp);
+      if (!verified) {
+        return withCors(c, c.json({ error: "人机验证失败，请重试。" }, 400));
+      }
     }
 
     const normalizedLoginId = loginId.toLowerCase();
@@ -756,7 +780,20 @@ app.post("/api/auth/email/start", async (c) => {
     return withCors(c, c.json({ error: "系统暂未开放注册。" }, 403));
   }
 
-  const { email, username, clientId } = await c.req.json<{ email?: string; username?: string; clientId?: string }>();
+  const { email, username, clientId, turnstileToken } = await c.req.json<{ email?: string; username?: string; clientId?: string; turnstileToken?: string }>();
+
+  // 检查 Turnstile 验证
+  const turnstileSettings = await getTurnstileSettings(c.env.DB, c.env.OIDC_PRIVATE_JWK);
+  if (turnstileSettings.enabled && turnstileSettings.enableOnRegister) {
+    if (!turnstileToken) {
+      return withCors(c, c.json({ error: "请完成人机验证。" }, 400));
+    }
+    const remoteIp = c.req.header("CF-Connecting-IP") || c.req.header("X-Forwarded-For");
+    const verified = await verifyTurnstileToken(turnstileSettings.secretKey, turnstileToken, remoteIp);
+    if (!verified) {
+      return withCors(c, c.json({ error: "人机验证失败，请重试。" }, 400));
+    }
+  }
 
   // 检查应用级注册开关
   if (clientId) {
@@ -929,10 +966,23 @@ app.post("/api/auth/email/verify", async (c) => {
 });
 
 app.post("/api/auth/password/reset/start", async (c) => {
-  const { email } = await c.req.json<{ email?: string }>();
+  const { email, turnstileToken } = await c.req.json<{ email?: string; turnstileToken?: string }>();
   const normalizedEmail = normalizeEmail(email);
   if (!normalizedEmail) {
     return withCors(c, c.json({ error: "请输入有效邮箱。" }, 400));
+  }
+
+  // 检查 Turnstile 验证
+  const turnstileSettings = await getTurnstileSettings(c.env.DB, c.env.OIDC_PRIVATE_JWK);
+  if (turnstileSettings.enabled && turnstileSettings.enableOnPasswordReset) {
+    if (!turnstileToken) {
+      return withCors(c, c.json({ error: "请完成人机验证。" }, 400));
+    }
+    const remoteIp = c.req.header("CF-Connecting-IP") || c.req.header("X-Forwarded-For");
+    const verified = await verifyTurnstileToken(turnstileSettings.secretKey, turnstileToken, remoteIp);
+    if (!verified) {
+      return withCors(c, c.json({ error: "人机验证失败，请重试。" }, 400));
+    }
   }
 
   const rateLimitError = await checkEmailCodeRateLimit(c.env.DB, "reset_password", normalizedEmail);
@@ -1129,11 +1179,25 @@ app.post("/api/account/email/start", async (c) => {
   if (!session) {
     return withCors(c, c.json({ error: "请先登录。" }, 401));
   }
-  const { email } = await c.req.json<{ email?: string }>();
+  const { email, turnstileToken } = await c.req.json<{ email?: string; turnstileToken?: string }>();
   const normalizedEmail = normalizeEmail(email);
   if (!normalizedEmail) {
     return withCors(c, c.json({ error: "请输入有效邮箱。" }, 400));
   }
+
+  // 检查 Turnstile 验证
+  const turnstileSettings = await getTurnstileSettings(c.env.DB, c.env.OIDC_PRIVATE_JWK);
+  if (turnstileSettings.enabled && turnstileSettings.enableOnEmailChange) {
+    if (!turnstileToken) {
+      return withCors(c, c.json({ error: "请完成人机验证。" }, 400));
+    }
+    const remoteIp = c.req.header("CF-Connecting-IP") || c.req.header("X-Forwarded-For");
+    const verified = await verifyTurnstileToken(turnstileSettings.secretKey, turnstileToken, remoteIp);
+    if (!verified) {
+      return withCors(c, c.json({ error: "人机验证失败，请重试。" }, 400));
+    }
+  }
+
   const rateLimitError = await checkEmailCodeRateLimit(c.env.DB, "bind_email", normalizedEmail, session.user_id);
   if (rateLimitError) {
     await recordAuditEvent(c, {
@@ -1866,6 +1930,55 @@ app.post("/api/admin/smtp/test", async (c) => {
     metadata: { provider: emailDelivery.provider, deliveryId: deliveryResult.id }
   });
   return withCors(c, c.json({ ok: true }));
+});
+
+// Turnstile 人机验证配置
+app.get("/api/admin/turnstile", async (c) => {
+  const session = await getCurrentSession(c.env.DB, getCookie(c, sessionCookie));
+  if (!session) {
+    return withCors(c, c.json({ error: "请先登录。" }, 401));
+  }
+  const user = await getUserById(c.env.DB, session.user_id);
+  if (!user?.is_admin) {
+    return withCors(c, c.json({ error: "需要管理员权限。" }, 403));
+  }
+  const settings = await getTurnstileSettings(c.env.DB, c.env.OIDC_PRIVATE_JWK);
+  return withCors(c, c.json(settings));
+});
+
+app.post("/api/admin/turnstile", async (c) => {
+  const session = await getCurrentSession(c.env.DB, getCookie(c, sessionCookie));
+  if (!session) {
+    return withCors(c, c.json({ error: "请先登录。" }, 401));
+  }
+  const user = await getUserById(c.env.DB, session.user_id);
+  if (!user?.is_admin) {
+    return withCors(c, c.json({ error: "需要管理员权限。" }, 403));
+  }
+  const body = await c.req.json<TurnstileSettings>();
+
+  // 验证必填字段
+  if (body.enabled && (!body.siteKey || !body.secretKey)) {
+    return withCors(c, c.json({ error: "启用 Turnstile 时，站点密钥和密钥不能为空。" }, 400));
+  }
+
+  await saveTurnstileSettings(c.env.DB, c.env.OIDC_PRIVATE_JWK, body);
+  await recordAuditEvent(c, {
+    actorType: "admin",
+    actorId: session.user_id,
+    eventType: "turnstile_updated",
+    targetType: "system",
+    targetId: "turnstile",
+    metadata: { enabled: body.enabled }
+  });
+
+  return withCors(c, c.json({ message: "Turnstile 配置已保存。" }));
+});
+
+// 获取公开的 Turnstile 配置（不包含密钥）
+app.get("/api/public/turnstile", async (c) => {
+  const settings = await getPublicTurnstileSettings(c.env.DB);
+  return withCors(c, c.json(settings));
 });
 
 app.get("/api/admin/clients", async (c) => {
@@ -3587,6 +3700,88 @@ async function getPublicSmtpConfig(db: D1Database, privateJwk: string): Promise<
     fromEmail: config.fromEmail,
     fromName: config.fromName
   };
+}
+
+// Turnstile 人机验证配置
+async function saveTurnstileSettings(db: D1Database, privateJwk: string, settings: TurnstileSettings): Promise<void> {
+  const value = {
+    enabled: settings.enabled,
+    siteKey: settings.siteKey,
+    secretKeyEncrypted: settings.secretKey ? await encryptSecret(privateJwk, settings.secretKey) : null,
+    enableOnLogin: settings.enableOnLogin,
+    enableOnRegister: settings.enableOnRegister,
+    enableOnPasswordReset: settings.enableOnPasswordReset,
+    enableOnEmailChange: settings.enableOnEmailChange
+  };
+  await db.prepare("INSERT OR REPLACE INTO app_settings (key, value, updated_at) VALUES ('turnstile', ?, ?)")
+    .bind(JSON.stringify(value), new Date().toISOString())
+    .run();
+}
+
+async function getTurnstileSettings(db: D1Database, privateJwk: string): Promise<TurnstileSettings> {
+  const row = await db.prepare("SELECT value FROM app_settings WHERE key = 'turnstile'").first<{ value: string }>();
+  if (!row) {
+    return {
+      enabled: false,
+      siteKey: "",
+      secretKey: "",
+      enableOnLogin: true,
+      enableOnRegister: true,
+      enableOnPasswordReset: true,
+      enableOnEmailChange: true
+    };
+  }
+  const value = JSON.parse(row.value) as Omit<TurnstileSettings, "secretKey"> & { secretKeyEncrypted: string | null };
+  return {
+    enabled: value.enabled,
+    siteKey: value.siteKey,
+    secretKey: value.secretKeyEncrypted ? await decryptSecret(privateJwk, value.secretKeyEncrypted) : "",
+    enableOnLogin: value.enableOnLogin,
+    enableOnRegister: value.enableOnRegister,
+    enableOnPasswordReset: value.enableOnPasswordReset !== false,
+    enableOnEmailChange: value.enableOnEmailChange !== false
+  };
+}
+
+async function getPublicTurnstileSettings(db: D1Database): Promise<Omit<TurnstileSettings, "secretKey">> {
+  const row = await db.prepare("SELECT value FROM app_settings WHERE key = 'turnstile'").first<{ value: string }>();
+  if (!row) {
+    return {
+      enabled: false,
+      siteKey: "",
+      enableOnLogin: true,
+      enableOnRegister: true,
+      enableOnPasswordReset: true,
+      enableOnEmailChange: true
+    };
+  }
+  const value = JSON.parse(row.value);
+  return {
+    enabled: value.enabled || false,
+    siteKey: value.siteKey || "",
+    enableOnLogin: value.enableOnLogin !== false,
+    enableOnRegister: value.enableOnRegister !== false,
+    enableOnPasswordReset: value.enableOnPasswordReset !== false,
+    enableOnEmailChange: value.enableOnEmailChange !== false
+  };
+}
+
+async function verifyTurnstileToken(secretKey: string, token: string, remoteIp?: string): Promise<boolean> {
+  try {
+    const response = await fetch("https://challenges.cloudflare.com/turnstile/v0/siteverify", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        secret: secretKey,
+        response: token,
+        remoteip: remoteIp
+      })
+    });
+    const result = await response.json<{ success: boolean }>();
+    return result.success;
+  } catch {
+    return false;
+  }
 }
 
 async function encryptSecret(privateJwk: string, plainText: string): Promise<string> {
